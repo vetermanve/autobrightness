@@ -1,0 +1,41 @@
+#!/bin/bash
+# ddc-tune - adjust an external monitor's white point and brightness over DDC/CI.
+# Warmer = lower blue gain, cooler = lower red gain, green stays as reference.
+# Values are stored in the monitor's own NVRAM and survive a power cycle.
+#
+# Usage: ddc-tune [-d NAME] show | bright N | contrast N | warm [N] | cool [N] | rgb R G B | reset
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+TARGET="${DDC_DISPLAY:-}"
+if [ "${1:-}" = "-d" ]; then TARGET="$2"; shift 2; fi
+
+if [ -n "$TARGET" ]; then
+    D=$(m1ddc display list 2>/dev/null | grep -F "$TARGET" | sed -n 's/^\[\([0-9]*\)\].*/\1/p' | head -1)
+else
+    # no name given: take the first display that answers a luminance read
+    for i in $(m1ddc display list 2>/dev/null | sed -n 's/^\[\([0-9]*\)\].*/\1/p'); do
+        v=$(m1ddc display "$i" max luminance 2>/dev/null)
+        [ -n "$v" ] && [ "$v" != "0" ] && { D=$i; break; }
+    done
+fi
+[ -n "${D:-}" ] || { echo "no DDC-capable display found. m1ddc display list:"; m1ddc display list; exit 1; }
+
+g() { m1ddc display "$D" get "$1" 2>/dev/null; }
+s() { m1ddc display "$D" set "$1" "$2" >/dev/null 2>&1; }
+clamp() { local v=$1; [ "$v" -lt 0 ] && v=0; [ "$v" -gt 100 ] && v=100; echo "$v"; }
+show() {
+    printf 'display %s   brightness %-4s contrast %-4s   R %-4s G %-4s B %-4s\n' \
+        "$D" "$(g luminance)" "$(g contrast)" "$(g red)" "$(g green)" "$(g blue)"
+}
+
+case "${1:-show}" in
+  show)     show ;;
+  bright)   s luminance "$(clamp "${2:?needs 0-100}")"; show ;;
+  contrast) s contrast  "$(clamp "${2:?needs 0-100}")"; show ;;
+  warm)     s blue "$(clamp $(( $(g blue) - ${2:-5} )))"; show ;;
+  cool)     s red  "$(clamp $(( $(g red)  - ${2:-5} )))"; show ;;
+  rgb)      s red "$(clamp "${2:?}")"; s green "$(clamp "${3:?}")"; s blue "$(clamp "${4:?}")"; show ;;
+  reset)    s red 50; s green 50; s blue 50; show ;;
+  *) echo "ddc-tune [-d NAME] show | bright N | contrast N | warm [N] | cool [N] | rgb R G B | reset"; exit 2 ;;
+esac

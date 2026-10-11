@@ -1,0 +1,122 @@
+#!/bin/bash
+# display-check - one-shot acceptance report for an external monitor.
+# Shows DDC responsiveness, decoded EDID (bit depth, panel size, declared HDR and
+# peak luminance, chromaticity), EDR headroom and the HiDPI modes macOS offers.
+# Useful for checking what a monitor really is versus what its listing claimed.
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+
+echo "=============== DDC ==============="
+if command -v m1ddc >/dev/null; then
+    m1ddc display list 2>&1
+    echo
+    for i in $(m1ddc display list 2>/dev/null | sed -n 's/^\[\([0-9]*\)\].*/\1/p'); do
+        nm=$(m1ddc display list 2>/dev/null | sed -n "s/^\[$i\] \(.*\) (.*/\1/p")
+        # read three times: DDC is noisy on some panels, a single read can lie
+        a=$(m1ddc display "$i" get luminance 2>&1); b=$(m1ddc display "$i" get luminance 2>&1); c=$(m1ddc display "$i" get luminance 2>&1)
+        printf '  [%s] %-20s brightness: %s %s %s   max: %s\n' "$i" "$nm" "$a" "$b" "$c" "$(m1ddc display "$i" max luminance 2>&1)"
+    done
+else
+    echo "  m1ddc not installed: brew install m1ddc"
+fi
+
+echo
+echo "=============== EDID ==============="
+ioreg -lw0 2>/dev/null | grep -oE '"EDID" = <[0-9a-f]+>' | sed 's/.*<//;s/>//' | sort -u > "$T/edids"
+python3 - "$T/edids" <<'PY'
+import sys
+LET = lambda v: chr(((v>>10)&31)+64) + chr(((v>>5)&31)+64) + chr((v&31)+64)
+pair = lambda hi, lo2: ((hi<<2)|lo2)/1024.0
+for line in open(sys.argv[1]):
+    h = line.strip()
+    if len(h) < 256: continue
+    e = bytes.fromhex(h)
+    if e[:8] != b'\x00\xff\xff\xff\xff\xff\xff\x00': continue
+    mfg, prod = LET(int.from_bytes(e[8:10],'big')), int.from_bytes(e[10:12],'little')
+    ser = int.from_bytes(e[12:16],'little')
+    week, year = e[16], e[17]+1990
+    vin = e[20]
+    bits = {0:'unspecified',1:'6',2:'8',3:'10',4:'12',5:'14',6:'16'}.get((vin>>4)&7,'?')
+    iface = {0:'unspecified',1:'DVI',2:'HDMI-a',3:'HDMI-b',4:'MDDI',5:'DisplayPort'}.get(vin&15,'?')
+    wcm, hcm = e[21], e[22]
+    diag = (wcm**2 + hcm**2) ** 0.5 / 2.54 if wcm and hcm else 0
+    name = ''
+    for off in (54,72,90,108):
+        d = e[off:off+18]
+        if d[:3] == b'\x00\x00\x00' and d[3] == 0xfc:
+            name = d[5:].split(b'\n')[0].decode('ascii','replace').strip()
+    d = e[54:72]
+    px = ((d[4] >> 4) << 8) | d[2]
+    py = ((d[7] >> 4) << 8) | d[5]
+    clk = int.from_bytes(d[0:2],'little') / 100.0
+    b25, b26 = e[25], e[26]
+    Wx, Wy = pair(e[33],(b26>>2)&3), pair(e[34],b26&3)
+    try:
+        n = (Wx-0.3320)/(0.1858-Wy); cct = 437*n**3 + 3601*n**2 + 6861*n + 5517
+    except ZeroDivisionError:
+        cct = float('nan')
+    print(f"  {mfg}{prod:04x}  \"{name}\"")
+    print(f"    serial 0x{ser:08x}   made: week {week} / {year}")
+    print(f"    {'digital' if vin & 0x80 else 'analog'}, bits per channel: {bits}, interface: {iface}")
+    print(f"    panel {wcm}x{hcm} cm = {diag:.1f} inch,  native {px}x{py} @ {clk:.0f} MHz")
+    print(f"    white point ({Wx:.4f},{Wy:.4f}) ~{cct:.0f}K   sRGB flag: {'yes' if e[24] & 0x04 else 'no'}")
+    if len(e) >= 256 and e[128] == 0x02:
+        dtd_off, i, found = e[130], 132, False
+        while i < dtd_off and i < 255:
+            tag, ln = e[i] >> 5, e[i] & 31
+            if tag == 7 and ln >= 3 and e[i+1] == 6:
+                eotf = e[i+2]
+                modes = [n for bit,n in ((0,'SDR'),(1,'HDR-gamma'),(2,'PQ/ST2084'),(3,'HLG')) if eotf & (1<<bit)]
+                out = f"    HDR: EOTF {', '.join(modes)}"
+                if ln >= 5: out += f",  peak {50*2**(e[i+4]/32):.0f} nits"
+                if ln >= 6: out += f",  max frame-average {50*2**(e[i+5]/32):.0f} nits"
+                print(out); found = True
+            i += ln + 1
+        if not found: print("    HDR: not declared")
+    print()
+PY
+
+echo "=============== EDR headroom / link depth ==============="
+cat > "$T/edr.swift" <<'SW'
+import AppKit
+for s in NSScreen.screens {
+    let d = s.depth.bitsPerPixel
+    let nm = s.localizedName.padding(toLength: max(24, s.localizedName.count), withPad: " ", startingAt: 0)
+    let hr = String(format: "%.2f", s.maximumExtendedDynamicRangeColorComponentValue)
+    let pt = String(format: "%.2f", s.maximumPotentialExtendedDynamicRangeColorComponentValue)
+    print("  \(nm) headroom \(hr)  potential \(pt)  link \(d)bpp (" + (d >= 30 ? "10-bit, HDR active" : "8-bit, SDR") + ")")
+}
+SW
+swift "$T/edr.swift" 2>&1
+
+echo
+echo "=============== HiDPI modes ==============="
+cat > "$T/modes.swift" <<'SW'
+import CoreGraphics
+import AppKit
+var n: UInt32 = 0
+CGGetActiveDisplayList(0, nil, &n)
+var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+CGGetActiveDisplayList(n, &ids, &n)
+let opts = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
+let names = Dictionary(uniqueKeysWithValues: NSScreen.screens.compactMap { s -> (CGDirectDisplayID,String)? in
+    guard let v = s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+    return (CGDirectDisplayID(v.uint32Value), s.localizedName) })
+for id in ids {
+    guard let modes = CGDisplayCopyAllDisplayModes(id, opts) as? [CGDisplayMode] else { continue }
+    let nat = modes.map { ($0.pixelWidth, $0.pixelHeight) }.max { $0.0 < $1.0 } ?? (0,0)
+    print("  \(names[id] ?? "id \(id)") - largest backing store \(nat.0)x\(nat.1)")
+    var seen = Set<Int>(), rows: [(Int,Int)] = []
+    for m in modes where m.pixelWidth == m.width * 2 && !seen.contains(m.width) {
+        seen.insert(m.width); rows.append((m.width, m.height))
+    }
+    for (w,h) in rows.sorted(by: { $0.0 < $1.0 }) {
+        print(String(format: "      looks like %4dx%-5d  backing %4dx%-5d", w, h, w*2, h*2))
+    }
+    if let mx = rows.map({$0.0}).max() {
+        print("      widest HiDPI backing store: \(mx*2) px  (M4/M5 cap is 6720)")
+    } else { print("      no HiDPI modes") }
+}
+SW
+swift "$T/modes.swift" 2>&1

@@ -1,0 +1,194 @@
+#!/bin/bash
+# autocontrast - match external monitors to room light on macOS.
+#
+# Input:  the built-in display's brightness. With auto-brightness enabled it already
+#         tracks ambient light. Reading it costs ~9 ms and touches no DDC.
+# Output: brightness and blue gain on external monitors, over DDC/CI.
+#
+# This is NOT True Tone. Apple measures the room's colour TEMPERATURE with a
+# multi-channel sensor and does not expose that data. This uses ambient LEVEL only:
+# brighter room -> brighter and more neutral, darker room -> dimmer and warmer.
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# ---- defaults; override in ~/.config/autocontrast/config ----
+# Monitors: "name:lum_min:lum_max:blue_min:blue_max"
+# Empty blue fields mean the monitor has no RGB gain control - brightness only.
+# The name must match what `m1ddc display list` prints.
+DISPLAYS=(
+  "CR270ST:15:90:38:50"
+  "HP P24h G4:10:85::"
+)
+B_LO=0.05;  B_HI=0.95      # built-in brightness anchor points
+HYST_LUM=2; HYST_BLUE=2    # ignore smaller drifts
+INTERVAL=10                # agent poll period, seconds
+RESYNC_EVERY=18            # every N ticks re-read monitors (catches OSD edits)
+RAMP_DIRECT=4              # deltas up to this are written in one go, no ramp
+RAMP_MAX_STEPS=80          # step cap; one DDC write costs about 63 ms
+# -------------------------------------------------------------
+
+CONFIG="${AUTOCONTRAST_CONFIG:-$HOME/.config/autocontrast/config}"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+STATE_DIR="$HOME/.local/state"
+PAUSE_FILE="$STATE_DIR/autocontrast.paused"
+SEEN_FILE="$STATE_DIR/autocontrast.settings-seen"
+TICK_FILE="$STATE_DIR/autocontrast.tick"
+LOG_FILE="$STATE_DIR/autocontrast.log"
+BB="$HOME/.local/libexec/autocontrast-builtin-brightness"
+PLIST="$HOME/Library/LaunchAgents/local.autocontrast.plist"
+
+die() { echo "$1" >&2; exit 1; }
+interp() { awk -v x="$1" -v xl="$2" -v xh="$3" -v yl="$4" -v yh="$5" \
+    'BEGIN{ t=(x-xl)/(xh-xl); if(t<0)t=0; if(t>1)t=1; printf "%d", yl+t*(yh-yl) }'; }
+absdiff() { awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{d=a-b; if(d<0)d=-d; print d}'; }
+slug() { echo "$1" | tr -c 'A-Za-z0-9' '_'; }
+logline() {
+    mkdir -p "$STATE_DIR"
+    echo "$(date '+%H:%M:%S') $*" >> "$LOG_FILE"
+    tail -300 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+}
+find_display() { m1ddc display list 2>/dev/null | grep -F "$1" | sed -n 's/^\[\([0-9]*\)\].*/\1/p' | head -1; }
+parse() { # spec -> sets name ll lh bl bh
+    name="${1%%:*}"; local r="${1#*:}"
+    ll="${r%%:*}"; r="${r#*:}"; lh="${r%%:*}"; r="${r#*:}"
+    bl="${r%%:*}"; bh="${r#*:}"
+}
+
+# Ramp in single DDC units - the hardware has no finer resolution.
+# Deliberately linear: with one-unit steps, easing the acceleration would have to
+# skip values in the middle, which is exactly the stutter we are removing.
+ramp() { # idx from_lum to_lum from_blue to_blue
+    local idx=$1 fl=$2 tl=$3 fb=$4 tb=$5 steps
+    steps=$(awk -v a="$(absdiff "$tl" "$fl")" -v b="$(absdiff "$tb" "$fb")" -v mx="$RAMP_MAX_STEPS" \
+            'BEGIN{ s=(a>b?a:b); if(s<1)s=1; if(s>mx)s=mx; print s }')
+    local last_l=$fl last_b=$fb l bl
+    while read -r l bl; do
+        [ "$l"  != "$last_l" ] && { m1ddc display "$idx" set luminance "$l" >/dev/null 2>&1; last_l=$l; }
+        [ -n "$fb" ] && [ "$bl" != "$last_b" ] && { m1ddc display "$idx" set blue "$bl" >/dev/null 2>&1; last_b=$bl; }
+    done < <(awk -v fl="$fl" -v tl="$tl" -v fb="${fb:-0}" -v tb="${tb:-0}" -v n="$steps" 'BEGIN{
+        for (i=1; i<=n; i++) { t=i/n; printf "%d %d\n", fl+(tl-fl)*t+0.5, fb+(tb-fb)*t+0.5 }
+    }')
+}
+
+# Drive one monitor to target. Run in background so monitors move together.
+apply_one() { # spec builtin_brightness tick
+    local spec="$1" b="$2" tick="$3" name ll lh bl bh
+    parse "$spec"
+    local st="$STATE_DIR/autocontrast.$(slug "$name").state"
+    local want_lum want_blue=""
+    want_lum=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
+    [ -n "$bl" ] && want_blue=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+
+    local c_lum="" c_blue=""
+    [ -f "$st" ] && read -r c_lum c_blue < "$st" 2>/dev/null
+
+    # fast path: target unchanged and not a resync tick -> no DDC traffic at all
+    if [ -n "$c_lum" ] && [ $(( tick % RESYNC_EVERY )) -ne 0 ] \
+       && [ "$(absdiff "$want_lum" "$c_lum")" -lt "$HYST_LUM" ] \
+       && { [ -z "$want_blue" ] || [ "$(absdiff "$want_blue" "$c_blue")" -lt "$HYST_BLUE" ]; }; then
+        return 0
+    fi
+
+    local idx; idx=$(find_display "$name"); [ -n "$idx" ] || return 0   # unplugged, wait quietly
+    local cur_lum cur_blue=""
+    cur_lum=$(m1ddc display "$idx" get luminance 2>/dev/null); cur_lum=${cur_lum:-$want_lum}
+    [ -n "$want_blue" ] && { cur_blue=$(m1ddc display "$idx" get blue 2>/dev/null); cur_blue=${cur_blue:-$want_blue}; }
+
+    local d_lum d_blue=0
+    d_lum=$(absdiff "$want_lum" "$cur_lum")
+    [ -n "$want_blue" ] && d_blue=$(absdiff "$want_blue" "$cur_blue")
+
+    if [ "$d_lum" -ge "$HYST_LUM" ] || [ "$d_blue" -ge "$HYST_BLUE" ]; then
+        logline "$name: $cur_lum/${cur_blue:--} -> $want_lum/${want_blue:--} (builtin $b, d=$d_lum/$d_blue)"
+        if [ "$d_lum" -le "$RAMP_DIRECT" ] && [ "$d_blue" -le 2 ]; then
+            [ "$d_lum"  -gt 0 ] && m1ddc display "$idx" set luminance "$want_lum" >/dev/null 2>&1
+            [ "$d_blue" -gt 0 ] && m1ddc display "$idx" set blue "$want_blue" >/dev/null 2>&1
+        else
+            ramp "$idx" "$cur_lum" "$want_lum" "$cur_blue" "$want_blue"
+        fi
+        echo "$want_lum $want_blue" > "$st"
+    else
+        echo "$cur_lum $cur_blue" > "$st"
+    fi
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  pause)   mkdir -p "$STATE_DIR"; touch "$PAUSE_FILE"; echo "paused"; exit 0 ;;
+  resume)  rm -f "$PAUSE_FILE" "$STATE_DIR"/autocontrast.*.state; echo "resumed"; exit 0 ;;
+  install)
+    mkdir -p "$(dirname "$PLIST")"
+    cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.autocontrast</string>
+  <key>ProgramArguments</key><array>
+    <string>$HOME/.local/bin/autocontrast</string><string>once</string></array>
+  <key>StartInterval</key><integer>$INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/autocontrast.err</string>
+</dict></plist>
+PLIST
+    launchctl unload "$PLIST" 2>/dev/null
+    launchctl load "$PLIST" && echo "agent installed, polling every ${INTERVAL}s"
+    exit 0 ;;
+  uninstall)
+    launchctl unload "$PLIST" 2>/dev/null
+    rm -f "$PLIST" "$STATE_DIR"/autocontrast.*.state
+    echo "agent removed"; exit 0 ;;
+esac
+
+[ -x "$BB" ] || die "missing $BB - run install.sh"
+b=$($BB) || die "cannot read built-in display brightness"
+
+case "$cmd" in
+  status)
+    echo "built-in display: brightness $b"
+    for spec in "${DISPLAYS[@]}"; do
+        parse "$spec"
+        idx=$(find_display "$name")
+        if [ -z "$idx" ]; then printf '  %-14s not connected\n' "$name"; continue; fi
+        wl=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
+        wb="-"; [ -n "$bl" ] && wb=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+        cl=$(m1ddc display "$idx" get luminance 2>/dev/null)
+        cb="-"; [ -n "$bl" ] && cb=$(m1ddc display "$idx" get blue 2>/dev/null)
+        printf '  %-14s target %3s/%-3s  now %3s/%-3s\n' "$name" "$wl" "$wb" "${cl:-?}" "${cb:-?}"
+    done
+    [ -f "$PAUSE_FILE" ] && echo "state: PAUSED"
+    exit 0 ;;
+
+  curve)
+    for spec in "${DISPLAYS[@]}"; do
+        parse "$spec"
+        echo "$name  (built-in brightness -> luminance/blue)"
+        for x in 0.00 0.10 0.20 0.30 0.40 0.50 0.60 0.70 0.80 0.90 1.00; do
+            wb="-"; [ -n "$bl" ] && wb=$(interp "$x" "$B_LO" "$B_HI" "$bl" "$bh")
+            printf '  %-6s -> %3s / %-3s%s\n' "$x" "$(interp "$x" "$B_LO" "$B_HI" "$ll" "$lh")" "$wb" \
+                "$(awk -v a="$x" -v c="$b" 'BEGIN{d=a-c; if(d<0)d=-d; print (d<0.05 ? "   <- now" : "")}')"
+        done
+    done
+    exit 0 ;;
+
+  once)
+    mkdir -p "$STATE_DIR"
+    # Detect System Settings opening on its own. Runs every tick, including idle ones.
+    now_open=$(pgrep -f 'System Settings' >/dev/null 2>&1 && echo 1 || echo 0)
+    was_open=0; [ -f "$SEEN_FILE" ] && was_open=$(cat "$SEEN_FILE" 2>/dev/null || echo 0)
+    if [ "$now_open" != "$was_open" ]; then
+        [ "$now_open" = 1 ] && logline "SYSTEM SETTINGS OPENED" || logline "system settings closed"
+        echo "$now_open" > "$SEEN_FILE"
+    fi
+    [ -f "$PAUSE_FILE" ] && exit 0
+
+    tick=0; [ -f "$TICK_FILE" ] && tick=$(cat "$TICK_FILE" 2>/dev/null || echo 0)
+    tick=$(( tick + 1 )); echo "$tick" > "$TICK_FILE"
+
+    for spec in "${DISPLAYS[@]}"; do apply_one "$spec" "$b" "$tick" & done
+    wait
+    exit 0 ;;
+
+  *) echo "autocontrast status | curve | once | pause | resume | install | uninstall"; exit 2 ;;
+esac
