@@ -11,7 +11,9 @@
 //
 //   softdim get <name>
 //   softdim set <name> <0-100>
-//   softdim daemon <interval_ms> <panel_nits> <name:lum_min:lum_max> ...
+//   softdim daemon <interval_ms> <panel_nits> <panel_gamma> <name:lum_min:lum_max> ...
+//   softdim steps <name> <from> <to> <step> <seconds>   - calibration sweep
+//   softdim follow <name> <file>   - hold whatever value the file contains
 import CoreGraphics
 import AppKit
 import Foundation
@@ -80,10 +82,10 @@ case "set":
     apply(id, v)
 
 case "daemon":
-    guard a.count >= 5, let intervalMs = Double(a[2]), let panelNits = Double(a[3]),
-          panelNits > 0 else { exit(2) }
+    guard a.count >= 6, let intervalMs = Double(a[2]), let panelNits = Double(a[3]),
+          let panelGamma = Double(a[4]), panelNits > 0, panelGamma > 0 else { exit(2) }
     struct Target { let name: String; let lo: Double; let hi: Double; var applied: Double }
-    var targets = a[4...].compactMap { spec -> Target? in
+    var targets = a[5...].compactMap { spec -> Target? in
         let f = spec.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
         guard f.count == 3, let lo = Double(f[1]), let hi = Double(f[2]) else { return nil }
         return Target(name: f[0], lo: lo, hi: hi, applied: -1)
@@ -92,12 +94,27 @@ case "daemon":
     FileHandle.standardError.write("softdim daemon: \(targets.map{$0.name})\n".data(using: .utf8)!)
 
     // Gamma writes are sub-millisecond, so the ramp can be far finer than DDC allows.
+    // The DDC agent and this daemon share one pause file. While paused the daemon
+    // stops touching the gamma table entirely rather than holding its last value,
+    // so another process - a calibration sweep, say - can own the display.
+    let pauseFile = (NSHomeDirectory() as NSString)
+        .appendingPathComponent(".local/state/autobrightness.paused")
     while true {
+        if FileManager.default.fileExists(atPath: pauseFile) {
+            for i in targets.indices { targets[i].applied = -1 }
+            Thread.sleep(forTimeInterval: intervalMs / 1000.0)
+            continue
+        }
         if let nits = builtinNits() {
             for i in targets.indices {
                 guard let id = find(targets[i].name) else { targets[i].applied = -1; continue }
-                // Match absolute luminance, then clamp into the configured window.
-                let want = min(targets[i].hi, max(targets[i].lo, 100.0 * nits / panelNits))
+                // The gamma table scales the ENCODED signal, and the panel then
+                // raises it to its own gamma. Scaling by 0.56 therefore emits about
+                // 0.56^2.2 = 0.27 of full light, not 0.56 - which is why a naive
+                // linear scale came out roughly twice too dark. Undo the panel
+                // curve so the multiplier lands on the luminance we actually want.
+                let ratio = max(0.0, min(1.0, nits / panelNits))
+                let want = min(targets[i].hi, max(targets[i].lo, 100.0 * pow(ratio, 1.0 / panelGamma)))
                 // Re-apply if the display was reconfigured and dropped our table.
                 let live = current(id) ?? -1
                 var from = targets[i].applied
@@ -115,6 +132,41 @@ case "daemon":
         }
         Thread.sleep(forTimeInterval: intervalMs / 1000.0)
     }
+
+case "follow":
+    // Holds the value written into a file, re-reading it a few times a second.
+    // Needed because macOS drops the gamma table when the setter exits, so manual
+    // calibration cannot be done with one-shot writes.
+    guard a.count >= 4, let id = find(a[2]) else { exit(2) }
+    let path = a[3]
+    setvbuf(stdout, nil, _IONBF, 0)
+    var last = -1.0
+    while true {
+        if let txt = try? String(contentsOfFile: path, encoding: .utf8),
+           let v = Double(txt.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            if v != last { print("гамма \(Int(v))"); last = v }
+            apply(id, v)
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+
+case "steps":
+    // Calibration sweep. The process has to stay alive for the whole sweep:
+    // macOS drops the gamma table the moment the setter exits.
+    guard a.count >= 7, let id = find(a[2]),
+          let from = Double(a[3]), let to = Double(a[4]),
+          let step = Double(a[5]), let secs = Double(a[6]), step > 0 else { exit(2) }
+    setvbuf(stdout, nil, _IONBF, 0)
+    var v = from, n = 0
+    while (from <= to && v <= to) || (from > to && v >= to) {
+        n += 1
+        apply(id, v)
+        print("вариант \(n): гамма \(Int(v))")
+        Thread.sleep(forTimeInterval: secs)
+        v += (from <= to ? step : -step)
+    }
+    print("перебор закончен, держу последнее значение")
+    while true { apply(id, v - (from <= to ? step : -step)); Thread.sleep(forTimeInterval: 2) }
 
 default: exit(2)
 }

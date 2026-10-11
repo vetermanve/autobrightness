@@ -132,8 +132,23 @@ gamma table instead. This is a fallback, not an equal:
 | backlight life, power | saved | not saved |
 | tonal steps | all present | banding when dimmed hard |
 
-Keep `lum_min` around 20-25 for gamma displays; below that the picture turns
-muddy and starts to band.
+Keep `lum_min` around 20 for gamma displays; below that the picture turns muddy
+and starts to band. That floor is also the limit of how dark a software-dimmed
+panel can go, so it will stay brighter than its DDC neighbours in a dark room.
+
+**Set the monitor's own brightness to maximum and leave it there.** The gamma
+table can only take light away, so every point of hardware brightness you give up
+is cut off the top of its range - and silently, because nothing in software can
+see that setting. A panel found at OSD brightness 75 cost an hour here: it looked
+like a weak backlight, and the measured "panel peak" would have been a ceiling
+invented by a slider rather than anything physical.
+
+**Measure the peak, do not trust the spec sheet.** Set the gamma display to its
+full output, then dim a DDC-controlled monitor next to it until the two match;
+the DDC monitor's luminance at that point is the real peak. A six-year-old panel
+rated 250 nits measured 140 here. Feeding the paper figure into `DISPLAY_NITS`
+makes the conversion ask for roughly half the light it should, which looks exactly
+like the bug this whole mechanism exists to fix.
 
 macOS reverts a gamma table the moment the process that set it exits, so gamma
 displays cannot be served by a periodic one-shot. `autobrightness install` writes

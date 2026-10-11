@@ -30,6 +30,10 @@ B_LO=0.05;  B_HI=0.95      # built-in slider anchor points, used when MATCH=slid
 #            by slider percentage leaves externals ~30x too bright in the dark.
 #   slider - the old linear map between the anchor points above.
 MATCH=nits
+# Display gamma, used only by software-dimmed panels. The gamma table scales the
+# encoded signal, so the multiplier has to be the 1/GAMMA power of the luminance
+# ratio you want. 2.2 is the sRGB figure; calibrate by eye if a panel disagrees.
+PANEL_GAMMA=2.2
 # Panel peak luminance in nits, needed to convert. Check the spec sheet, or read
 # the declared value with display-check.
 DISPLAY_NITS=(
@@ -231,7 +235,7 @@ PLIST
             echo "  <key>Label</key><string>local.autobrightness-gamma</string>"
             echo "  <key>ProgramArguments</key><array>"
             echo "    <string>$SOFTDIM</string><string>daemon</string>"
-            echo "    <string>$(( INTERVAL * 1000 ))</string><string>${gnits:-250}</string>"
+            echo "    <string>$(( INTERVAL * 1000 ))</string><string>${gnits:-250}</string><string>$PANEL_GAMMA</string>"
             for g in "${gspecs[@]}"; do echo "    <string>$g</string>"; done
             echo "  </array>"
             echo "  <key>KeepAlive</key><true/>"
