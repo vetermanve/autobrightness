@@ -84,6 +84,41 @@ of numbers for the end that looks wrong. Set brightness first: a luminance
 mismatch between screens reads as a colour mismatch, and chasing white point
 before brightness is chasing a ghost.
 
+## Why it matches by luminance, not by percentage
+
+The built-in display's brightness slider is badly nonlinear in actual light
+output. Measured on a 14" M-series XDR by reading `IOMFBBrightnessLevel` out of
+the IORegistry while sweeping the slider:
+
+```
+slider |  nits  | share of max | a linear map would say
+  0.05 |    1.0 |        0.2 % |                 20 nits
+  0.10 |    1.5 |        0.4 % |                 40 nits
+  0.20 |    4.7 |        1.2 % |                 80 nits
+  0.30 |   14.6 |        3.7 % |                120 nits
+  0.40 |   45.2 |       11.3 % |                160 nits
+  0.50 |  140.0 |       35.0 % |                200 nits
+  0.70 |  202.5 |       50.6 % |                280 nits
+  1.00 |  400.2 |      100.0 % |                400 nits
+```
+
+At slider 0.10 the panel is at **1.5 nits**. Mapping that percentage straight
+onto a 300-nit monitor puts it near 45 nits — thirty times too bright, and very
+obvious in a dark room.
+
+So `MATCH=nits` (the default) reads the built-in's real luminance and converts:
+
+```
+ddc_target = 100 * builtin_nits / panel_nits
+```
+
+clamped into the configured `lum_min`..`lum_max` window. Set each panel's peak
+luminance in `DISPLAY_NITS`; the spec sheet figure is close enough, and
+`display-check` prints the value the EDID declares.
+
+`MATCH=slider` restores the old linear map between `B_LO` and `B_HI` if you want
+to shape the response by hand instead.
+
 ## The gamma fallback
 
 For monitors that do not answer DDC, `mode: gamma` dims through the display's

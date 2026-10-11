@@ -22,7 +22,21 @@ DISPLAYS=(
   # for what that costs. Sixth field "gamma" selects it.
   # "DELL E2420HS:25:100:::gamma"
 )
-B_LO=0.05;  B_HI=0.95      # built-in brightness anchor points
+B_LO=0.05;  B_HI=0.95      # built-in slider anchor points, used when MATCH=slider
+
+# How the external target is derived from the built-in display.
+#   nits   - match absolute luminance. The built-in slider is badly nonlinear:
+#            slider 0.10 is about 1.5 nits while 1.00 is about 400, so matching
+#            by slider percentage leaves externals ~30x too bright in the dark.
+#   slider - the old linear map between the anchor points above.
+MATCH=nits
+# Panel peak luminance in nits, needed to convert. Check the spec sheet, or read
+# the declared value with display-check.
+DISPLAY_NITS=(
+  "CR270ST:300"
+  "HP P24h G4:250"
+  "DELL E2420HS:250"
+)
 HYST_LUM=2; HYST_BLUE=2    # ignore smaller drifts
 INTERVAL=5                 # agent poll period, seconds
 RESYNC_EVERY=2             # every N ticks re-read monitors (catches OSD edits)
@@ -56,6 +70,38 @@ logline() {
     tail -300 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
 }
 find_display() { m1ddc display list 2>/dev/null | grep -F "$1" | sed -n 's/^\[\([0-9]*\)\].*/\1/p' | head -1; }
+max_nits() { # name -> panel peak luminance, empty when unknown
+    local e
+    for e in "${DISPLAY_NITS[@]}"; do
+        case "$e" in "$1:"*) echo "${e##*:}"; return;; esac
+    done
+}
+
+# Target luminance for one display, in DDC units, from the current ambient reading.
+target_lum() { # name ll lh
+    local mx
+    if [ "$MATCH" = "nits" ]; then
+        mx=$(max_nits "$1")
+        if [ -n "$mx" ]; then
+            awk -v n="$b_nits" -v mx="$mx" -v lo="$2" -v hi="$3" 'BEGIN{
+                v = 100 * n / mx
+                if (v < lo) v = lo; if (v > hi) v = hi
+                printf "%d", v + 0.5 }'
+            return
+        fi
+    fi
+    interp "$b" "$B_LO" "$B_HI" "$2" "$3"
+}
+
+# Blue gain follows where the luminance landed, not the raw slider.
+target_blue() { # want_lum ll lh bl bh
+    [ -z "$4" ] && return
+    awk -v w="$1" -v lo="$2" -v hi="$3" -v bl="$4" -v bh="$5" 'BEGIN{
+        t = (hi > lo ? (w - lo) / (hi - lo) : 1)
+        if (t < 0) t = 0; if (t > 1) t = 1
+        printf "%d", bl + t * (bh - bl) + 0.5 }'
+}
+
 parse() { # spec -> sets name ll lh bl bh mode
     local IFS=:
     read -r name ll lh bl bh mode <<< "$1"
@@ -69,13 +115,13 @@ parse() { # spec -> sets name ll lh bl bh mode
 # The target is recomputed every RAMP_CHUNK units of travel from a fresh ambient
 # reading. Without that the agent drives to a target that went stale while it was
 # moving, arrives, and only then notices - which reads as chasing, not tracking.
-ramp() { # idx cur_lum cur_blue ll lh bl bh
-    local idx=$1 cur=$2 curb=$3 ll=$4 lh=$5 bl=$6 bh=$7
+ramp() { # idx name cur_lum cur_blue ll lh bl bh
+    local idx=$1 name=$2 cur=$3 curb=$4 ll=$5 lh=$6 bl=$7 bh=$8
     local budget=$(( RAMP_MAX_STEPS * 3 )) want wantb b l x leg legb
     while [ "$budget" -gt 0 ]; do
-        b=$($BB) || break
-        want=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
-        wantb=""; [ -n "$bl" ] && wantb=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+        read -r b b_nits b_cap < <($BB --nits) || break
+        want=$(target_lum "$name" "$ll" "$lh")
+        wantb=$(target_blue "$want" "$ll" "$lh" "$bl" "$bh")
         if [ "$want" = "$cur" ] && { [ -z "$wantb" ] || [ "$wantb" = "$curb" ]; }; then break; fi
 
         # How far we are allowed to travel before re-checking ambient light.
@@ -104,8 +150,8 @@ apply_one() { # spec builtin_brightness tick
     [ "$mode" = "gamma" ] && return 0   # held by the resident daemon, not by this tick
     local st="$STATE_DIR/autobrightness.$(slug "$name").state"
     local want_lum want_blue=""
-    want_lum=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
-    [ -n "$bl" ] && want_blue=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+    want_lum=$(target_lum "$name" "$ll" "$lh")
+    want_blue=$(target_blue "$want_lum" "$ll" "$lh" "$bl" "$bh")
 
     local c_lum="" c_blue=""
     [ -f "$st" ] && read -r c_lum c_blue < "$st" 2>/dev/null
@@ -136,7 +182,7 @@ apply_one() { # spec builtin_brightness tick
             [ "$d_lum"  -gt 0 ] && m1ddc display "$idx" set luminance "$want_lum" >/dev/null 2>&1
             [ "$d_blue" -gt 0 ] && m1ddc display "$idx" set blue "$want_blue" >/dev/null 2>&1
         else
-            ramp "$idx" "$cur_lum" "$cur_blue" "$ll" "$lh" "$bl" "$bh"
+            ramp "$idx" "$name" "$cur_lum" "$cur_blue" "$ll" "$lh" "$bl" "$bh"
             want_lum=$RAMP_LUM; want_blue=$RAMP_BLUE
         fi
         echo "$want_lum $want_blue" > "$st"
@@ -169,10 +215,10 @@ PLIST
     # Displays without DDC are dimmed through the gamma table, and macOS drops a
     # gamma table when the process that set it exits - so they need a resident
     # daemon rather than a periodic tick.
-    gspecs=()
+    gspecs=(); gnits=
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
-        [ "$mode" = "gamma" ] && gspecs+=("$name:$ll:$lh")
+        [ "$mode" = "gamma" ] && gspecs+=("$name:$ll:$lh") && gnits=$(max_nits "$name")
     done
     launchctl unload "$GPLIST" 2>/dev/null
     rm -f "$GPLIST"
@@ -185,7 +231,7 @@ PLIST
             echo "  <key>Label</key><string>local.autobrightness-gamma</string>"
             echo "  <key>ProgramArguments</key><array>"
             echo "    <string>$SOFTDIM</string><string>daemon</string>"
-            echo "    <string>$(( INTERVAL * 1000 ))</string><string>$B_LO</string><string>$B_HI</string>"
+            echo "    <string>$(( INTERVAL * 1000 ))</string><string>${gnits:-250}</string>"
             for g in "${gspecs[@]}"; do echo "    <string>$g</string>"; done
             echo "  </array>"
             echo "  <key>KeepAlive</key><true/>"
@@ -204,14 +250,14 @@ PLIST
 esac
 
 [ -x "$BB" ] || die "missing $BB - run install.sh"
-b=$($BB) || die "cannot read built-in display brightness"
+read -r b b_nits b_cap < <($BB --nits) || die "cannot read built-in display brightness"
 
 case "$cmd" in
   status)
     echo "built-in display: brightness $b"
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
-        wl=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
+        wl=$(target_lum "$name" "$ll" "$lh")
         if [ "$mode" = "gamma" ]; then
             printf '  %-14s target %3s     now %3s      (gamma, software dimming)\n' \
                 "$name" "$wl" "$("$SOFTDIM" get "$name" 2>/dev/null || echo '?')"
@@ -219,7 +265,7 @@ case "$cmd" in
         fi
         idx=$(find_display "$name")
         if [ -z "$idx" ]; then printf '  %-14s not connected\n' "$name"; continue; fi
-        wb="-"; [ -n "$bl" ] && wb=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+        wb="-"; [ -n "$bl" ] && wb=$(target_blue "$wl" "$ll" "$lh" "$bl" "$bh")
         cl=$(m1ddc display "$idx" get luminance 2>/dev/null)
         cb="-"; [ -n "$bl" ] && cb=$(m1ddc display "$idx" get blue 2>/dev/null)
         printf '  %-14s target %3s/%-3s  now %3s/%-3s\n' "$name" "$wl" "$wb" "${cl:-?}" "${cb:-?}"

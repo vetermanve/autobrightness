@@ -11,10 +11,11 @@
 //
 //   softdim get <name>
 //   softdim set <name> <0-100>
-//   softdim daemon <interval_ms> <b_lo> <b_hi> <name:lum_min:lum_max> ...
+//   softdim daemon <interval_ms> <panel_nits> <name:lum_min:lum_max> ...
 import CoreGraphics
 import AppKit
 import Foundation
+import IOKit
 
 let CAP = 256
 
@@ -41,18 +42,23 @@ func current(_ id: CGDirectDisplayID) -> Double? {
     return Double(r[Int(cnt) - 1]) * 100.0
 }
 
-typealias GetBr = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
-func builtinBrightness() -> Double? {
-    guard let h = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW),
-          let sym = dlsym(h, "DisplayServicesGetBrightness") else { return nil }
-    let fn = unsafeBitCast(sym, to: GetBr.self)
-    var n: UInt32 = 0
-    CGGetActiveDisplayList(0, nil, &n)
-    var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
-    CGGetActiveDisplayList(n, &ids, &n)
-    for id in ids where CGDisplayIsBuiltin(id) != 0 {
-        var v: Float = -1
-        if fn(id, &v) == 0 { return Double(v) }
+// Actual luminance of the built-in panel, in nits. The brightness slider is badly
+// nonlinear - slider 0.10 is about 1.5 nits against 400 at 1.00 - so matching an
+// external by slider percentage leaves it roughly thirty times too bright in a
+// dark room. The built-in framebuffer is the one with no Transport property.
+func builtinNits() -> Double? {
+    var iter: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault,
+            IOServiceMatching("IOMobileFramebufferShim"), &iter) == KERN_SUCCESS else { return nil }
+    defer { IOObjectRelease(iter) }
+    while case let svc = IOIteratorNext(iter), svc != 0 {
+        defer { IOObjectRelease(svc) }
+        if IORegistryEntryCreateCFProperty(svc, "Transport" as CFString, kCFAllocatorDefault, 0) != nil { continue }
+        guard IORegistryEntryCreateCFProperty(svc, "DisplayAttributes" as CFString, kCFAllocatorDefault, 0) != nil
+        else { continue }
+        guard let lv = IORegistryEntryCreateCFProperty(svc, "IOMFBBrightnessLevel" as CFString,
+                kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber else { continue }
+        return lv.doubleValue / 65536.0
     }
     return nil
 }
@@ -74,10 +80,10 @@ case "set":
     apply(id, v)
 
 case "daemon":
-    guard a.count >= 6, let intervalMs = Double(a[2]),
-          let bLo = Double(a[3]), let bHi = Double(a[4]) else { exit(2) }
+    guard a.count >= 5, let intervalMs = Double(a[2]), let panelNits = Double(a[3]),
+          panelNits > 0 else { exit(2) }
     struct Target { let name: String; let lo: Double; let hi: Double; var applied: Double }
-    var targets = a[5...].compactMap { spec -> Target? in
+    var targets = a[4...].compactMap { spec -> Target? in
         let f = spec.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
         guard f.count == 3, let lo = Double(f[1]), let hi = Double(f[2]) else { return nil }
         return Target(name: f[0], lo: lo, hi: hi, applied: -1)
@@ -87,10 +93,11 @@ case "daemon":
 
     // Gamma writes are sub-millisecond, so the ramp can be far finer than DDC allows.
     while true {
-        if let b = builtinBrightness() {
+        if let nits = builtinNits() {
             for i in targets.indices {
                 guard let id = find(targets[i].name) else { targets[i].applied = -1; continue }
-                let want = interp(b, bLo, bHi, targets[i].lo, targets[i].hi)
+                // Match absolute luminance, then clamp into the configured window.
+                let want = min(targets[i].hi, max(targets[i].lo, 100.0 * nits / panelNits))
                 // Re-apply if the display was reconfigured and dropped our table.
                 let live = current(id) ?? -1
                 var from = targets[i].applied
