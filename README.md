@@ -143,8 +143,13 @@ offers for each display.
 Reading the built-in display's brightness costs about 9 ms and touches no DDC, so
 the agent can poll often. The last applied value is cached per monitor; when the
 target has not moved, a tick exits in under 50 ms without a single DDC
-transaction. Every 18th tick the cache is bypassed and the monitors are re-read,
-which catches changes made through the monitor's own OSD.
+transaction.
+
+Every 2nd tick the cache is bypassed and the monitors are re-read, which catches
+changes made through the monitor's own OSD. That read is what bounds how long a
+manual adjustment survives: 10 seconds here. Raising `RESYNC_EVERY` stretches
+that window and buys very little — a read costs about 63 ms, so checking two
+monitors every 10 seconds is a bit over one percent of bus time.
 
 One DDC write costs about 63 ms on the hardware this was built against, and that
 is what paces the ramp. Transitions step in single DDC units — the finest the
