@@ -1,5 +1,5 @@
 #!/bin/bash
-# autocontrast - match external monitors to room light on macOS.
+# autobrightness - match external monitors to room light on macOS.
 #
 # Input:  the built-in display's brightness. With auto-brightness enabled it already
 #         tracks ambient light. Reading it costs ~9 ms and touches no DDC.
@@ -11,33 +11,39 @@
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-# ---- defaults; override in ~/.config/autocontrast/config ----
+# ---- defaults; override in ~/.config/autobrightness/config ----
 # Monitors: "name:lum_min:lum_max:blue_min:blue_max"
 # Empty blue fields mean the monitor has no RGB gain control - brightness only.
 # The name must match what `m1ddc display list` prints.
 DISPLAYS=(
   "CR270ST:15:90:38:50"
   "HP P24h G4:10:85::"
+  # Panels that do not answer DDC can be dimmed in software instead - see README
+  # for what that costs. Sixth field "gamma" selects it.
+  # "DELL E2420HS:25:100:::gamma"
 )
 B_LO=0.05;  B_HI=0.95      # built-in brightness anchor points
 HYST_LUM=2; HYST_BLUE=2    # ignore smaller drifts
-INTERVAL=10                # agent poll period, seconds
+INTERVAL=5                 # agent poll period, seconds
 RESYNC_EVERY=18            # every N ticks re-read monitors (catches OSD edits)
 RAMP_DIRECT=4              # deltas up to this are written in one go, no ramp
-RAMP_MAX_STEPS=80          # step cap; one DDC write costs about 63 ms
+RAMP_MAX_STEPS=80          # step budget cap; one DDC write costs about 63 ms
+RAMP_CHUNK=8               # units of travel between ambient re-checks mid-ramp
 # -------------------------------------------------------------
 
-CONFIG="${AUTOCONTRAST_CONFIG:-$HOME/.config/autocontrast/config}"
+CONFIG="${AUTOBRIGHTNESS_CONFIG:-$HOME/.config/autobrightness/config}"
 # shellcheck source=/dev/null
 [ -f "$CONFIG" ] && . "$CONFIG"
 
 STATE_DIR="$HOME/.local/state"
-PAUSE_FILE="$STATE_DIR/autocontrast.paused"
-SEEN_FILE="$STATE_DIR/autocontrast.settings-seen"
-TICK_FILE="$STATE_DIR/autocontrast.tick"
-LOG_FILE="$STATE_DIR/autocontrast.log"
-BB="$HOME/.local/libexec/autocontrast-builtin-brightness"
-PLIST="$HOME/Library/LaunchAgents/local.autocontrast.plist"
+PAUSE_FILE="$STATE_DIR/autobrightness.paused"
+SEEN_FILE="$STATE_DIR/autobrightness.settings-seen"
+TICK_FILE="$STATE_DIR/autobrightness.tick"
+LOG_FILE="$STATE_DIR/autobrightness.log"
+BB="$HOME/.local/libexec/autobrightness-builtin-brightness"
+PLIST="$HOME/Library/LaunchAgents/local.autobrightness.plist"
+GPLIST="$HOME/Library/LaunchAgents/local.autobrightness-gamma.plist"
+SOFTDIM="$HOME/.local/libexec/autobrightness-softdim"
 
 die() { echo "$1" >&2; exit 1; }
 interp() { awk -v x="$1" -v xl="$2" -v xh="$3" -v yl="$4" -v yh="$5" \
@@ -50,33 +56,53 @@ logline() {
     tail -300 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
 }
 find_display() { m1ddc display list 2>/dev/null | grep -F "$1" | sed -n 's/^\[\([0-9]*\)\].*/\1/p' | head -1; }
-parse() { # spec -> sets name ll lh bl bh
-    name="${1%%:*}"; local r="${1#*:}"
-    ll="${r%%:*}"; r="${r#*:}"; lh="${r%%:*}"; r="${r#*:}"
-    bl="${r%%:*}"; bh="${r#*:}"
+parse() { # spec -> sets name ll lh bl bh mode
+    local IFS=:
+    read -r name ll lh bl bh mode <<< "$1"
+    mode="${mode:-ddc}"
 }
 
 # Ramp in single DDC units - the hardware has no finer resolution.
 # Deliberately linear: with one-unit steps, easing the acceleration would have to
-# skip values in the middle, which is exactly the stutter we are removing.
-ramp() { # idx from_lum to_lum from_blue to_blue
-    local idx=$1 fl=$2 tl=$3 fb=$4 tb=$5 steps
-    steps=$(awk -v a="$(absdiff "$tl" "$fl")" -v b="$(absdiff "$tb" "$fb")" -v mx="$RAMP_MAX_STEPS" \
-            'BEGIN{ s=(a>b?a:b); if(s<1)s=1; if(s>mx)s=mx; print s }')
-    local last_l=$fl last_b=$fb l bl
-    while read -r l bl; do
-        [ "$l"  != "$last_l" ] && { m1ddc display "$idx" set luminance "$l" >/dev/null 2>&1; last_l=$l; }
-        [ -n "$fb" ] && [ "$bl" != "$last_b" ] && { m1ddc display "$idx" set blue "$bl" >/dev/null 2>&1; last_b=$bl; }
-    done < <(awk -v fl="$fl" -v tl="$tl" -v fb="${fb:-0}" -v tb="${tb:-0}" -v n="$steps" 'BEGIN{
-        for (i=1; i<=n; i++) { t=i/n; printf "%d %d\n", fl+(tl-fl)*t+0.5, fb+(tb-fb)*t+0.5 }
-    }')
+# skip values in the middle of the move, reintroducing the stutter it removes.
+#
+# The target is recomputed every RAMP_CHUNK units of travel from a fresh ambient
+# reading. Without that the agent drives to a target that went stale while it was
+# moving, arrives, and only then notices - which reads as chasing, not tracking.
+ramp() { # idx cur_lum cur_blue ll lh bl bh
+    local idx=$1 cur=$2 curb=$3 ll=$4 lh=$5 bl=$6 bh=$7
+    local budget=$(( RAMP_MAX_STEPS * 3 )) want wantb b l x leg legb
+    while [ "$budget" -gt 0 ]; do
+        b=$($BB) || break
+        want=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
+        wantb=""; [ -n "$bl" ] && wantb=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
+        if [ "$want" = "$cur" ] && { [ -z "$wantb" ] || [ "$wantb" = "$curb" ]; }; then break; fi
+
+        # How far we are allowed to travel before re-checking ambient light.
+        read -r leg legb < <(awk -v c="$cur" -v w="$want" -v cb="${curb:-0}" -v wb="${wantb:-0}" -v k="$RAMP_CHUNK" 'BEGIN{
+            dl = w - c; adl = (dl < 0 ? -dl : dl)
+            frac = (adl > k ? k / adl : 1)
+            printf "%d %d\n", c + dl*frac + (dl < 0 ? -0.5 : 0.5), cb + (wb-cb)*frac + ((wb-cb) < 0 ? -0.5 : 0.5)
+        }')
+
+        while read -r l x; do
+            if [ "$l" != "$cur" ]; then m1ddc display "$idx" set luminance "$l" >/dev/null 2>&1; cur=$l; fi
+            if [ -n "$bl" ] && [ "$x" != "$curb" ]; then m1ddc display "$idx" set blue "$x" >/dev/null 2>&1; curb=$x; fi
+            budget=$(( budget - 1 ))
+        done < <(awk -v fl="$cur" -v tl="$leg" -v fb="${curb:-0}" -v tb="${legb:-0}" 'BEGIN{
+            n = (tl > fl ? tl - fl : fl - tl); if (n < 1) n = 1
+            for (i = 1; i <= n; i++) { t = i/n; printf "%d %d\n", fl+(tl-fl)*t+0.5, fb+(tb-fb)*t+0.5 }
+        }')
+    done
+    RAMP_LUM=$cur; RAMP_BLUE=$curb
 }
 
 # Drive one monitor to target. Run in background so monitors move together.
 apply_one() { # spec builtin_brightness tick
-    local spec="$1" b="$2" tick="$3" name ll lh bl bh
+    local spec="$1" b="$2" tick="$3" name ll lh bl bh mode
     parse "$spec"
-    local st="$STATE_DIR/autocontrast.$(slug "$name").state"
+    [ "$mode" = "gamma" ] && return 0   # held by the resident daemon, not by this tick
+    local st="$STATE_DIR/autobrightness.$(slug "$name").state"
     local want_lum want_blue=""
     want_lum=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
     [ -n "$bl" ] && want_blue=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
@@ -95,6 +121,10 @@ apply_one() { # spec builtin_brightness tick
     local cur_lum cur_blue=""
     cur_lum=$(m1ddc display "$idx" get luminance 2>/dev/null); cur_lum=${cur_lum:-$want_lum}
     [ -n "$want_blue" ] && { cur_blue=$(m1ddc display "$idx" get blue 2>/dev/null); cur_blue=${cur_blue:-$want_blue}; }
+    # A zero read on a DDC-capable panel means the I2C transaction collided with a
+    # write in flight, not that the monitor sits at zero. Trust the cache instead.
+    [ "$cur_lum" = "0" ] && [ -n "$c_lum" ] && [ "$c_lum" != "0" ] && cur_lum="$c_lum"
+    [ "${cur_blue:-}" = "0" ] && [ -n "$c_blue" ] && [ "$c_blue" != "0" ] && cur_blue="$c_blue"
 
     local d_lum d_blue=0
     d_lum=$(absdiff "$want_lum" "$cur_lum")
@@ -106,7 +136,8 @@ apply_one() { # spec builtin_brightness tick
             [ "$d_lum"  -gt 0 ] && m1ddc display "$idx" set luminance "$want_lum" >/dev/null 2>&1
             [ "$d_blue" -gt 0 ] && m1ddc display "$idx" set blue "$want_blue" >/dev/null 2>&1
         else
-            ramp "$idx" "$cur_lum" "$want_lum" "$cur_blue" "$want_blue"
+            ramp "$idx" "$cur_lum" "$cur_blue" "$ll" "$lh" "$bl" "$bh"
+            want_lum=$RAMP_LUM; want_blue=$RAMP_BLUE
         fi
         echo "$want_lum $want_blue" > "$st"
     else
@@ -117,27 +148,58 @@ apply_one() { # spec builtin_brightness tick
 cmd="${1:-status}"
 case "$cmd" in
   pause)   mkdir -p "$STATE_DIR"; touch "$PAUSE_FILE"; echo "paused"; exit 0 ;;
-  resume)  rm -f "$PAUSE_FILE" "$STATE_DIR"/autocontrast.*.state; echo "resumed"; exit 0 ;;
+  resume)  rm -f "$PAUSE_FILE" "$STATE_DIR"/autobrightness.*.state; echo "resumed"; exit 0 ;;
   install)
     mkdir -p "$(dirname "$PLIST")"
     cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>local.autocontrast</string>
+  <key>Label</key><string>local.autobrightness</string>
   <key>ProgramArguments</key><array>
-    <string>$HOME/.local/bin/autocontrast</string><string>once</string></array>
+    <string>$HOME/.local/bin/autobrightness</string><string>once</string></array>
   <key>StartInterval</key><integer>$INTERVAL</integer>
   <key>RunAtLoad</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/autocontrast.err</string>
+  <key>StandardErrorPath</key><string>/tmp/autobrightness.err</string>
 </dict></plist>
 PLIST
     launchctl unload "$PLIST" 2>/dev/null
     launchctl load "$PLIST" && echo "agent installed, polling every ${INTERVAL}s"
+
+    # Displays without DDC are dimmed through the gamma table, and macOS drops a
+    # gamma table when the process that set it exits - so they need a resident
+    # daemon rather than a periodic tick.
+    gspecs=()
+    for spec in "${DISPLAYS[@]}"; do
+        parse "$spec"
+        [ "$mode" = "gamma" ] && gspecs+=("$name:$ll:$lh")
+    done
+    launchctl unload "$GPLIST" 2>/dev/null
+    rm -f "$GPLIST"
+    if [ ${#gspecs[@]} -gt 0 ]; then
+        [ -x "$SOFTDIM" ] || die "missing $SOFTDIM - run install.sh"
+        {
+            echo '<?xml version="1.0" encoding="UTF-8"?>'
+            echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+            echo '<plist version="1.0"><dict>'
+            echo "  <key>Label</key><string>local.autobrightness-gamma</string>"
+            echo "  <key>ProgramArguments</key><array>"
+            echo "    <string>$SOFTDIM</string><string>daemon</string>"
+            echo "    <string>$(( INTERVAL * 1000 ))</string><string>$B_LO</string><string>$B_HI</string>"
+            for g in "${gspecs[@]}"; do echo "    <string>$g</string>"; done
+            echo "  </array>"
+            echo "  <key>KeepAlive</key><true/>"
+            echo "  <key>RunAtLoad</key><true/>"
+            echo "  <key>StandardErrorPath</key><string>/tmp/autobrightness-gamma.err</string>"
+            echo "</dict></plist>"
+        } > "$GPLIST"
+        launchctl load "$GPLIST" && echo "gamma daemon installed for: ${gspecs[*]%%:*}"
+    fi
     exit 0 ;;
   uninstall)
     launchctl unload "$PLIST" 2>/dev/null
-    rm -f "$PLIST" "$STATE_DIR"/autocontrast.*.state
+    launchctl unload "$GPLIST" 2>/dev/null
+    rm -f "$PLIST" "$GPLIST" "$STATE_DIR"/autobrightness.*.state
     echo "agent removed"; exit 0 ;;
 esac
 
@@ -149,9 +211,14 @@ case "$cmd" in
     echo "built-in display: brightness $b"
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
+        wl=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
+        if [ "$mode" = "gamma" ]; then
+            printf '  %-14s target %3s     now %3s      (gamma, software dimming)\n' \
+                "$name" "$wl" "$("$SOFTDIM" get "$name" 2>/dev/null || echo '?')"
+            continue
+        fi
         idx=$(find_display "$name")
         if [ -z "$idx" ]; then printf '  %-14s not connected\n' "$name"; continue; fi
-        wl=$(interp "$b" "$B_LO" "$B_HI" "$ll" "$lh")
         wb="-"; [ -n "$bl" ] && wb=$(interp "$b" "$B_LO" "$B_HI" "$bl" "$bh")
         cl=$(m1ddc display "$idx" get luminance 2>/dev/null)
         cb="-"; [ -n "$bl" ] && cb=$(m1ddc display "$idx" get blue 2>/dev/null)
@@ -190,5 +257,5 @@ case "$cmd" in
     wait
     exit 0 ;;
 
-  *) echo "autocontrast status | curve | once | pause | resume | install | uninstall"; exit 2 ;;
+  *) echo "autobrightness status | curve | once | pause | resume | install | uninstall"; exit 2 ;;
 esac

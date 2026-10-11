@@ -1,89 +1,120 @@
-# autocontrast
+# autobrightness
 
 Make external monitors follow room light on macOS.
 
 macOS adjusts the built-in display automatically and offers True Tone, but most
 third-party monitors get neither — the True Tone checkbox simply does not appear
 for them. This keeps them in step instead: it reads the built-in display's
-brightness, which already tracks ambient light, and drives external monitors over
-DDC/CI to match.
+brightness, which already tracks ambient light, and drives external monitors to
+match over DDC/CI, or through the gamma table when DDC is unavailable.
 
 ## What this is not
 
 **This is not True Tone.** Apple measures the room's colour *temperature* with a
-multi-channel ambient sensor and does not expose that reading. The sensor shows up
+multi-channel ambient sensor and does not expose that reading. The sensor appears
 in the IORegistry as an `AppleSPUHIDInterface` behind the AOP coprocessor and
 publishes only IOReport packet counters — no lux, no chromaticity.
 
-So this uses ambient *level* only: a brighter room means brighter and more neutral,
-a darker room means dimmer and warmer. Under a tungsten lamp and under daylight of
-the same intensity it behaves identically. True Tone would not.
+So this uses ambient *level* only: a brighter room means brighter and more
+neutral, a darker room means dimmer and warmer. Under a tungsten lamp and under
+daylight of the same intensity it behaves identically. True Tone would not.
 
 ## Requirements
 
 - Apple Silicon Mac with a built-in display, auto-brightness enabled
-- macOS with Xcode command line tools (`swiftc`)
+- Xcode command line tools (`swiftc`)
 - [`m1ddc`](https://github.com/waydabber/m1ddc) — `brew install m1ddc`
-- External monitors that answer DDC/CI. Many do not: check with `display-check`.
-  A monitor reporting `max luminance = 0` cannot be driven.
-- DisplayPort or USB-C works more reliably than HDMI for DDC on Apple Silicon.
 
 ## Install
 
 ```sh
-git clone https://github.com/vetermanve/autocontrast
-cd autocontrast
+git clone https://github.com/vetermanve/autobrightness
+cd autobrightness
 ./install.sh
 ```
 
-This compiles one small Swift helper and symlinks three commands into
-`~/.local/bin`. Nothing is written outside your home directory and no `sudo` is used.
+Two small Swift helpers are compiled and three commands are symlinked into
+`~/.local/bin`. Nothing is written outside your home directory, no `sudo`.
+
+## Which monitors can be driven
+
+Run `display-check` and look at `max luminance`:
+
+- **`max luminance = 100`** — DDC works. The backlight itself is controlled.
+- **`max luminance = 0`** — the monitor does not answer DDC. Use the gamma
+  fallback described below.
+
+Two things commonly break DDC, both worth checking before giving up:
+
+1. **The monitor's own DDC/CI switch.** Dell and others hide it under
+   `Menu > Others > DDC/CI`. Without it nothing works.
+2. **The connection.** DDC over the built-in HDMI port of an Apple Silicon Mac
+   has been broken since M1 and still is. The same panel on USB-C/DisplayPort
+   usually answers fine. Cheap USB-C hubs and HDMI adapters also strip DDC.
 
 ## Configure
 
-Find your monitors' names:
-
-```sh
-m1ddc display list
-```
-
-Then write `~/.config/autocontrast/config`:
+Find your monitors' names with `m1ddc display list`, then write
+`~/.config/autobrightness/config`:
 
 ```sh
 DISPLAYS=(
-  "CR270ST:15:90:38:50"
+  "CR270ST:0:90:38:50"
   "HP P24h G4:10:85::"
+  "DELL E2420HS:25:100:::gamma"
 )
 ```
 
-Each entry is `name:lum_min:lum_max:blue_min:blue_max`.
+Each entry is `name:lum_min:lum_max:blue_min:blue_max[:mode]`.
 
-- `name` — any substring that matches the `m1ddc display list` output
+- `name` — any substring matching the `m1ddc display list` output
 - `lum_min` / `lum_max` — monitor brightness at the dark and bright ends
-- `blue_min` / `blue_max` — blue gain, where 50 is neutral and lower is warmer.
-  **Leave both empty** if the monitor has no RGB gain control; brightness only.
+- `blue_min` / `blue_max` — blue gain, 50 is neutral, lower is warmer.
+  **Leave both empty** when the monitor has no RGB gain control.
+- `mode` — `ddc` (default) or `gamma`
 
 Check the mapping before trusting it:
 
 ```sh
-autocontrast curve
+autobrightness curve
 ```
 
-Calibrate in both extremes — in daylight and in a dark room — and adjust the
-pair of numbers for the end that looks wrong. Set brightness first: a luminance
+Calibrate in both extremes — in daylight and in a dark room — and adjust the pair
+of numbers for the end that looks wrong. Set brightness first: a luminance
 mismatch between screens reads as a colour mismatch, and chasing white point
 before brightness is chasing a ghost.
+
+## The gamma fallback
+
+For monitors that do not answer DDC, `mode: gamma` dims through the display's
+gamma table instead. This is a fallback, not an equal:
+
+| | DDC | gamma |
+|---|---|---|
+| what changes | backlight current | the signal into the panel |
+| black level | drops with white | stays exactly where it was |
+| contrast | preserved | falls |
+| backlight life, power | saved | not saved |
+| tonal steps | all present | banding when dimmed hard |
+
+Keep `lum_min` around 20-25 for gamma displays; below that the picture turns
+muddy and starts to band.
+
+macOS reverts a gamma table the moment the process that set it exits, so gamma
+displays cannot be served by a periodic one-shot. `autobrightness install` writes
+a second launchd agent with `KeepAlive` that stays resident and owns the gamma.
+It also re-applies after a display reconfiguration drops the table.
 
 ## Run
 
 ```sh
-autocontrast install      # load the launchd agent, polls every 10s
-autocontrast status       # built-in brightness, targets, current values
-autocontrast curve        # full mapping table
-autocontrast once         # apply right now
-autocontrast pause        # stop interfering so you can adjust by hand
-autocontrast resume
-autocontrast uninstall
+autobrightness install      # load the launchd agents
+autobrightness status       # built-in brightness, targets, current values
+autobrightness curve        # full mapping table
+autobrightness once         # apply right now
+autobrightness pause        # stop interfering so you can adjust by hand
+autobrightness resume
+autobrightness uninstall
 ```
 
 Manual white point and brightness, for calibration:
@@ -111,7 +142,7 @@ offers for each display.
 
 Reading the built-in display's brightness costs about 9 ms and touches no DDC, so
 the agent can poll often. The last applied value is cached per monitor; when the
-target has not moved, the tick exits in under 50 ms without a single DDC
+target has not moved, a tick exits in under 50 ms without a single DDC
 transaction. Every 18th tick the cache is bypassed and the monitors are re-read,
 which catches changes made through the monitor's own OSD.
 
@@ -122,17 +153,26 @@ deliberately linear: with one-unit steps, easing the acceleration would have to
 skip values through the middle of the move, reintroducing exactly the stutter it
 was meant to remove.
 
-Small drifts (4 units or less) skip the ramp and are written directly, because
+**The target is recomputed mid-ramp**, every 8 units of travel, from a fresh
+ambient reading. Without that the agent drives toward a target that went stale
+while it was moving, arrives, and only then notices — which reads as chasing
+rather than tracking, and is very visible while you drag the brightness slider.
+
+Small drifts of 4 units or less skip the ramp and are written directly, because
 most ticks are slow auto-brightness drift and spending two dozen transactions on
 them would load the I2C bus for nothing. Monitors are driven in parallel so they
 move together.
+
+A luminance read of zero from a panel whose `max luminance` is 100 means the I2C
+transaction collided with a write in flight, not that the monitor is at zero. The
+agent falls back to its cache in that case; taking the zero at face value makes it
+ramp from the wrong starting point.
 
 ## Limitations
 
 - Ambient level only, not colour temperature. See above.
 - DDC brightness resolution is 1/100 of the range. Near the dark end a single
   step is a larger relative change than near the bright end.
-- Monitors without DDC/CI brightness cannot be driven at all.
 - A monitor's RGB gain control is often absent even when brightness works.
 - If you change brightness behind the agent's back it will not notice until the
   next resync tick, by design — so it does not fight you mid-adjustment.

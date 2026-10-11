@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs autocontrast into ~/.local (no sudo, nothing outside your home).
+# Installs autobrightness into ~/.local (no sudo, nothing outside your home).
 set -eu
 SRC="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"
@@ -10,10 +10,11 @@ command -v swiftc >/dev/null || { echo "swiftc is required: install Xcode comman
 
 mkdir -p "$BIN" "$LIBEXEC"
 
-echo "compiling builtin-brightness helper"
-swiftc -O -o "$LIBEXEC/autocontrast-builtin-brightness" "$SRC/src/builtin-brightness.swift"
+echo "compiling helpers"
+swiftc -O -o "$LIBEXEC/autobrightness-builtin-brightness" "$SRC/src/builtin-brightness.swift"
+swiftc -O -o "$LIBEXEC/autobrightness-softdim" "$SRC/src/softdim.swift"
 
-for f in autocontrast ddc-tune display-check; do
+for f in autobrightness ddc-tune display-check; do
     ln -sf "$SRC/bin/$f" "$BIN/$f"
     echo "linked $BIN/$f"
 done
@@ -25,7 +26,7 @@ esac
 
 echo
 echo "next:"
-echo "  1. autocontrast status          - see what it detects"
+echo "  1. autobrightness status          - see what it detects"
 echo "  2. edit the DISPLAYS list       - see README, config goes in"
-echo "                                    ~/.config/autocontrast/config"
-echo "  3. autocontrast install         - load the launchd agent"
+echo "                                    ~/.config/autobrightness/config"
+echo "  3. autobrightness install         - load the launchd agent"
