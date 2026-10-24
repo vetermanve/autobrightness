@@ -73,6 +73,24 @@ Each entry is `name:lum_min:lum_max:blue_min:blue_max[:mode]`.
   **Leave both empty** when the monitor has no RGB gain control.
 - `mode` — `ddc` (default) or `gamma`
 
+The solar model needs to know where you are, in degrees, north and east
+positive:
+
+```sh
+SOLAR_LAT=55.7558
+SOLAR_LON=37.6176
+```
+
+The menu bar app fills these in for you: "Use my time zone" reads the position
+macOS already ships for your zone in `/usr/share/zoneinfo/zone.tab` - no prompt,
+no network - and "Use my location" asks CoreLocation, which an ad-hoc signed app
+does not reliably get permission for. Either way the numbers stay editable: the
+zone's position is its reference city, and the sun's elevation is bucketed in
+five degree steps, so a city is close enough.
+
+Without coordinates the model stays off and a closed lid falls back to holding
+the last reading.
+
 Check the mapping before trusting it:
 
 ```sh
@@ -83,6 +101,78 @@ Calibrate in both extremes — in daylight and in a dark room — and adjust the
 of numbers for the end that looks wrong. Set brightness first: a luminance
 mismatch between screens reads as a colour mismatch, and chasing white point
 before brightness is chasing a ghost.
+
+## With the lid shut
+
+The built-in display is the sensor here, and closing the lid turns it off. The
+ambient sensor itself is no help either: it sits in the lid, next to the camera,
+and with the lid shut it faces the keyboard. **A clamshelled Mac has no reading
+of the room at all** - not a worse one, none.
+
+Three things went wrong before this was handled explicitly, all of them visible
+in the log:
+
+```
+23:54:40 HP P24h G4: 66/- -> 10/-  (builtin 0.0000)
+23:54:40 CR270ST:    55/45 -> 0/38 (builtin 0.0000)
+00:52:11 CR270ST:    0/38 -> 90/50 (builtin 0.9375)
+```
+
+A panel whose backlight is off reports zero nits, and zero nits read as a pitch
+dark room, so the monitors were driven to the floor as the lid came down and back
+to daylight when it opened. In between, the agent died every five seconds on the
+missing display - which is the only reason the monitors stayed put at all.
+
+So ambient is now resolved through a chain, and every link says what it is:
+
+| Source | What it is |
+|---|---|
+| `manual` | a level set by hand, from the menu bar app or `autobrightness manual`. An instruction, so it outranks every sensor until cleared |
+| `sensor` | `AMBIENT_CMD`, an external meter printing nits. Nothing ships with one - see `docs/ideas.md` |
+| `als` | the built-in display's luminance, the only real measurement available |
+| `solar` | this machine's own `als` history, replayed for the sun's current elevation |
+| `hold` | the last trusted reading, when the model has nothing for this hour |
+
+Two rules keep the bad readings out. **Zero nits is not a dark room** - it is a
+dark backlight, and it is refused. And a panel that has just woken is not trusted
+for `WAKE_SETTLE` seconds: macOS restores the pre-sleep brightness first and
+auto-brightness corrects it a moment later, so the first readings after a lid
+opens describe the room the Mac went to sleep in.
+
+If nothing in the chain can speak, the monitors are left exactly where they are.
+
+### What the solar model actually is
+
+Not a curve someone invented. While the lid is open the agent is already reading
+real luminance every few seconds, so it buckets those readings by the sun's
+elevation - 5 degrees per bucket, 36 buckets from horizon to horizon - and keeps
+a running mean per bucket. With the lid shut it looks up the bucket for the
+current elevation and replays what this machine measured there.
+
+That makes it a model of your habits as much as of the daylight: the buckets
+below the horizon are lamplight, and they learn what you actually set in the
+evening. The first `MODEL_MEAN_OVER` samples in a bucket form a plain mean;
+after that it becomes an EWMA with the same time constant, so a bucket settles on
+the habit across days rather than on the last visit. A bucket nobody has visited
+for `MODEL_FORGET_DAYS` is replaced outright - the season moved, or the lamps did.
+
+```sh
+autobrightness model     # what each bucket has learned
+autobrightness ambient   # which source is answering right now, and why
+autobrightness sun       # the sun's elevation, for checking against an almanac
+```
+
+Sun position is the low-precision NOAA formulation, good to about 0.01 degrees -
+three orders of magnitude finer than a bucket. It is checked against the equinox
+day length at three latitudes, the solstice noon elevation at the equator, and
+polar night: `tests/ambient-chain.test.sh`.
+
+### What it will never be
+
+The model replays a typical day. It cannot know that today is overcast, or that
+you turned a lamp on. For that there has to be a meter that can see the room with
+the lid shut, which means hardware - `AMBIENT_CMD` is the hook, and
+`docs/ideas.md` lists what fits.
 
 ## Why it matches by luminance, not by percentage
 
@@ -155,17 +245,33 @@ displays cannot be served by a periodic one-shot. `autobrightness install` write
 a second launchd agent with `KeepAlive` that stays resident and owns the gamma.
 It also re-applies after a display reconfiguration drops the table.
 
+That daemon takes no readings of its own. The tick resolves ambient once and
+leaves the result in `~/.local/state/autobrightness.ambient`; the daemon reads
+that file and holds its last level when the file goes stale. Two independent
+readers of the same sensor disagreed in exactly the case that matters: with the
+lid shut the agent held its last value while the daemon saw zero nits and drove
+to the floor.
+
 ## Run
 
 ```sh
 autobrightness install      # load the launchd agents
-autobrightness status       # built-in brightness, targets, current values
+autobrightness status       # ambient source, targets, current values
+autobrightness ambient      # which source is answering, how old it is
+autobrightness model        # what the solar model has learned
+autobrightness sun [epoch]  # the sun's elevation here
 autobrightness curve        # full mapping table
 autobrightness once         # apply right now
+autobrightness manual 40    # hold 40 nits worth of room light, whatever the sensors say
+autobrightness manual off   # back to automatic
 autobrightness pause        # stop interfering so you can adjust by hand
 autobrightness resume
 autobrightness uninstall
 ```
+
+A gauge in the menu bar shows which source is answering and lets you set a level
+by hand without a terminal: `macos/README.md`.
+
 
 Manual white point and brightness, for calibration:
 
@@ -221,7 +327,17 @@ move together.
 A luminance read of zero from a panel whose `max luminance` is 100 means the I2C
 transaction collided with a write in flight, not that the monitor is at zero. The
 agent falls back to its cache in that case; taking the zero at face value makes it
-ramp from the wrong starting point.
+ramp from the wrong starting point. The same guard covers `m1ddc` printing its
+errors on stdout: `Could not find a suitable external display.` arrives where a
+number should be, and as a number it is zero.
+
+Displays are resolved by UUID, not by the position they happen to hold in a list.
+`NSScreen.screens` is a per-process snapshot that refreshes only when an app's run
+loop handles a display-reconfiguration notification, so in a daemon it goes stale
+the first time a monitor sleeps - and `CGSetDisplayTransferByTable` reports no
+error for an id that no longer exists. A gamma daemon here spent thirteen days
+believing it was dimming a display. The agent writes a uuid-to-name map each tick
+and the daemon looks the id up live.
 
 ## Limitations
 
@@ -231,6 +347,9 @@ ramp from the wrong starting point.
 - A monitor's RGB gain control is often absent even when brightness works.
 - If you change brightness behind the agent's back it will not notice until the
   next resync tick, by design — so it does not fight you mid-adjustment.
+- With the lid shut nothing measures the room. The solar model replays a typical
+  day at that sun elevation; it cannot see an overcast afternoon or a lamp being
+  switched on. See `docs/ideas.md` for the hardware that would.
 
 ## License
 

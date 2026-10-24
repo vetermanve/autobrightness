@@ -1,18 +1,34 @@
 #!/bin/bash
 # autobrightness - match external monitors to room light on macOS.
 #
-# Input:  the built-in display's brightness. With auto-brightness enabled it already
-#         tracks ambient light. Reading it costs ~9 ms and touches no DDC.
-# Output: brightness and blue gain on external monitors, over DDC/CI.
+# Ambient light is resolved through a chain of sources, highest priority first:
+#
+#   manual  - a level set by hand, from the menu bar app or `autobrightness manual`.
+#             An instruction, so it outranks every sensor until cleared.
+#   sensor  - AMBIENT_CMD, an external meter printing nits. Nothing ships with it;
+#             see docs/ideas.md for what to plug in.
+#   als     - the built-in display's own luminance. With auto-brightness enabled it
+#             already tracks the ambient sensor, and reading it costs ~9 ms.
+#   solar   - a model of this machine's own als history against the sun's elevation,
+#             used when the panel is off: lid shut, or displays asleep.
+#   hold    - the last trusted als reading, when the model has nothing for this hour.
+#
+# The built-in panel is the only real sensor here, and it is dark exactly when the
+# lid is shut - the ambient sensor sits in the lid and faces the keyboard. So a
+# closed lid leaves the Mac with no measurement at all, and what the solar source
+# replays is this machine's own measured history, not an invented curve.
 #
 # This is NOT True Tone. Apple measures the room's colour TEMPERATURE with a
 # multi-channel sensor and does not expose that data. This uses ambient LEVEL only:
 # brighter room -> brighter and more neutral, darker room -> dimmer and warmer.
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# awk prints a decimal comma under a ru/de/fr locale, and every later comparison
+# then reads the number as zero. Not cosmetic: nits are fractional.
+export LC_ALL=C
 
 # ---- defaults; override in ~/.config/autobrightness/config ----
-# Monitors: "name:lum_min:lum_max:blue_min:blue_max"
+# Monitors: "name:lum_min:lum_max:blue_min:blue_max[:mode]"
 # Empty blue fields mean the monitor has no RGB gain control - brightness only.
 # The name must match what `m1ddc display list` prints.
 DISPLAYS=(
@@ -24,11 +40,13 @@ DISPLAYS=(
 )
 B_LO=0.05;  B_HI=0.95      # built-in slider anchor points, used when MATCH=slider
 
-# How the external target is derived from the built-in display.
+# How the external target is derived from the ambient reading.
 #   nits   - match absolute luminance. The built-in slider is badly nonlinear:
 #            slider 0.10 is about 1.5 nits while 1.00 is about 400, so matching
 #            by slider percentage leaves externals ~30x too bright in the dark.
-#   slider - the old linear map between the anchor points above.
+#   slider - the old linear map between the anchor points above. Only the als
+#            source has a slider position, so this falls back to nits whenever
+#            the built-in panel is off.
 MATCH=nits
 # Display gamma, used only by software-dimmed panels. The gamma table scales the
 # encoded signal, so the multiplier has to be the 1/GAMMA power of the luminance
@@ -47,21 +65,48 @@ RESYNC_EVERY=2             # every N ticks re-read monitors (catches OSD edits)
 RAMP_DIRECT=4              # deltas up to this are written in one go, no ramp
 RAMP_MAX_STEPS=80          # step budget cap; one DDC write costs about 63 ms
 RAMP_CHUNK=8               # units of travel between ambient re-checks mid-ramp
+
+# ---- ambient sources ----
+# Coordinates for the solar model. Without them the model is off entirely and a
+# closed lid falls through to hold. Degrees, north and east positive.
+SOLAR_LAT=""; SOLAR_LON=""
+# A command printing one ambient value in nits on stdout. Empty means no meter.
+AMBIENT_CMD=""
+# macOS restores the pre-sleep brightness when a panel wakes and auto-brightness
+# corrects it only a moment later, so readings taken right after the panel comes
+# back describe the room it went to sleep in. Hold for this long instead.
+WAKE_SETTLE=10
+SAMPLE_EVERY=60            # seconds between samples fed to the solar model
+MODEL_BIN_DEG=5            # sun elevation bucket width, degrees
+MODEL_MEAN_OVER=50         # samples averaged per bucket before it becomes an EWMA
+MODEL_FORGET_DAYS=30       # a bucket older than this is replaced, not blended
+MODEL_SPAN=3               # buckets searched either side when one has no data
+HOLD_MAX_AGE=0             # 0 = hold the last reading forever; else give up after N s
 # -------------------------------------------------------------
 
 CONFIG="${AUTOBRIGHTNESS_CONFIG:-$HOME/.config/autobrightness/config}"
 # shellcheck source=/dev/null
 [ -f "$CONFIG" ] && . "$CONFIG"
 
-STATE_DIR="$HOME/.local/state"
+# Both paths are overridable so the test suite can run against its own state
+# directory and a stub brightness reader, without racing the live agent.
+STATE_DIR="${AUTOBRIGHTNESS_STATE:-$HOME/.local/state}"
 PAUSE_FILE="$STATE_DIR/autobrightness.paused"
 SEEN_FILE="$STATE_DIR/autobrightness.settings-seen"
 TICK_FILE="$STATE_DIR/autobrightness.tick"
 LOG_FILE="$STATE_DIR/autobrightness.log"
-BB="$HOME/.local/libexec/autobrightness-builtin-brightness"
+AMBIENT_FILE="$STATE_DIR/autobrightness.ambient"    # resolved value, read by softdim
+LIVE_FILE="$STATE_DIR/autobrightness.live"          # last trusted als reading
+PHASE_FILE="$STATE_DIR/autobrightness.phase"        # als|off and since when
+MANUAL_FILE="$STATE_DIR/autobrightness.manual"      # hand-set level
+MODEL_FILE="$STATE_DIR/autobrightness.solar"        # the learned curve
+SAMPLE_FILE="$STATE_DIR/autobrightness.sample"      # when the model last took a sample
+MAP_FILE="$STATE_DIR/autobrightness.displays"       # uuid -> name, read by softdim
+BB="${AUTOBRIGHTNESS_BB:-$HOME/.local/libexec/autobrightness-builtin-brightness}"
 PLIST="$HOME/Library/LaunchAgents/local.autobrightness.plist"
 GPLIST="$HOME/Library/LaunchAgents/local.autobrightness-gamma.plist"
 SOFTDIM="$HOME/.local/libexec/autobrightness-softdim"
+CONTRACT=1   # shape of --indicator; raise it together with the menu bar app
 
 die() { echo "$1" >&2; exit 1; }
 interp() { awk -v x="$1" -v xl="$2" -v xh="$3" -v yl="$4" -v yh="$5" \
@@ -80,24 +125,193 @@ max_nits() { # name -> panel peak luminance, empty when unknown
         case "$e" in "$1:"*) echo "${e##*:}"; return;; esac
     done
 }
+isnum() { awk -v v="${1:-}" 'BEGIN{ exit !(v ~ /^[0-9]+(\.[0-9]+)?$/) }'; }
 
-# Target luminance for one display, in DDC units, from the current ambient reading.
+# ---- solar position ----------------------------------------------------------
+# Low-precision NOAA formulas: about 0.01 deg, which is three orders of magnitude
+# finer than a 5 deg bucket. Verified against the equinox day length at three
+# latitudes, the solstice noon elevation at the equator, and polar night.
+sun_elev() { # epoch -> degrees above the horizon
+    awk -v t="$1" -v lat="$SOLAR_LAT" -v lon="$SOLAR_LON" 'BEGIN{
+        pi = atan2(0, -1); d2r = pi / 180
+        n = t / 86400.0 + 2440587.5 - 2451545.0      # days since J2000
+        L = (280.460 + 0.9856474 * n) % 360          # mean longitude
+        g = (357.528 + 0.9856003 * n) % 360          # mean anomaly
+        lam = L + 1.915 * sin(g * d2r) + 0.020 * sin(2 * g * d2r)
+        eps = 23.439 - 0.0000004 * n
+        sl = sin(lam * d2r); cl = cos(lam * d2r)
+        sd = sin(eps * d2r) * sl
+        dec = atan2(sd, sqrt(1 - sd * sd))
+        ra = atan2(cos(eps * d2r) * sl, cl) / d2r
+        gmst = (18.697374558 + 24.06570982441908 * n) % 24
+        if (gmst < 0) gmst += 24
+        H = gmst * 15 + lon - ra                     # hour angle
+        H = H - 360 * int(H / 360)
+        if (H > 180) H -= 360; if (H < -180) H += 360
+        sh = sin(lat * d2r) * sin(dec) + cos(lat * d2r) * cos(dec) * cos(H * d2r)
+        printf "%.2f", atan2(sh, sqrt(1 - sh * sh)) / d2r
+    }'
+}
+solar_on() { [ -n "$SOLAR_LAT" ] && [ -n "$SOLAR_LON" ]; }
+model_bin() { # elevation -> bucket index
+    awk -v e="$1" -v w="$MODEL_BIN_DEG" 'BEGIN{
+        last = int(180 / w) - 1
+        b = int((e + 90) / w); if (b < 0) b = 0; if (b > last) b = last
+        print b }'
+}
+
+# ---- the solar model --------------------------------------------------------
+# One line per elevation bucket: "bucket nits samples updated_epoch".
+# The first MODEL_MEAN_OVER samples form a plain running mean, after which the
+# bucket becomes an EWMA with that time constant - so a bucket settles on the
+# habit across days rather than on whatever the last visit happened to show. A
+# bucket untouched for MODEL_FORGET_DAYS is replaced outright: the season moved,
+# or the lamps did.
+model_sample() { # nits now
+    solar_on || return 0
+    local last=0
+    [ -f "$SAMPLE_FILE" ] && read -r last < "$SAMPLE_FILE" 2>/dev/null
+    isnum "${last:-}" || last=0
+    [ $(( $2 - ${last%.*} )) -ge "$SAMPLE_EVERY" ] || return 0
+    echo "$2" > "$SAMPLE_FILE"
+
+    local bin; bin=$(model_bin "$(sun_elev "$2")")
+    touch "$MODEL_FILE"
+    awk -v bin="$bin" -v nits="$1" -v now="$2" -v cap="$MODEL_MEAN_OVER" \
+        -v forget="$MODEL_FORGET_DAYS" '
+        $1 == bin {
+            if (now - $4 > forget * 86400) { print bin, nits, 1, now; done = 1; next }
+            n = $3 + 1
+            a = 1 / (n < cap ? n : cap)
+            printf "%s %.1f %d %d\n", bin, $2 + a * (nits - $2), n, now
+            done = 1; next
+        }
+        { print }
+        END { if (!done) printf "%s %.1f %d %d\n", bin, nits, 1, now }
+    ' "$MODEL_FILE" > "$MODEL_FILE.tmp" && mv "$MODEL_FILE.tmp" "$MODEL_FILE"
+}
+model_predict() { # bucket -> nits, or nothing when the model cannot say
+    [ -s "$MODEL_FILE" ] || return 1
+    awk -v bin="$1" -v span="$MODEL_SPAN" '
+        { v[$1 + 0] = $2 }
+        END {
+            if (bin in v) { printf "%.1f\n", v[bin]; exit 0 }
+            lo = -1; hi = -1
+            for (d = 1; d <= span; d++) {
+                if (lo < 0 && (bin - d) in v) { lo = bin - d; lov = v[lo] }
+                if (hi < 0 && (bin + d) in v) { hi = bin + d; hiv = v[hi] }
+            }
+            # Between two known buckets, interpolate. Past the end of what has
+            # been measured, hold the nearest bucket flat rather than run the
+            # slope off into numbers nothing supports.
+            if (lo >= 0 && hi >= 0) { printf "%.1f\n", lov + (bin - lo) / (hi - lo) * (hiv - lov); exit 0 }
+            if (lo >= 0) { printf "%.1f\n", lov; exit 0 }
+            if (hi >= 0) { printf "%.1f\n", hiv; exit 0 }
+            exit 1
+        }' "$MODEL_FILE"
+}
+model_bins() { # -> "filled total"
+    local total; total=$(awk -v w="$MODEL_BIN_DEG" 'BEGIN{ print int(180 / w) }')
+    local filled=0
+    [ -s "$MODEL_FILE" ] && filled=$(wc -l < "$MODEL_FILE" | tr -d ' ')
+    echo "$filled $total"
+}
+
+# ---- ambient resolution -----------------------------------------------------
+# Sets amb_nits, amb_source, amb_age, amb_slider (als only) and amb_elev.
+# Returns non-zero when no source can say anything, in which case nothing is
+# applied: the monitors keep whatever they have.
+amb_nits=""; amb_source=none; amb_age=0; amb_slider=""; amb_elev=""
+resolve_ambient() {
+    local now; now=$(date +%s)
+    amb_slider=""; amb_age=0; amb_elev=""; amb_nits=""; amb_source=none
+    solar_on && amb_elev=$(sun_elev "$now")
+
+    # 1. a hand-set level outranks every sensor - it is an instruction, not a guess
+    if [ -f "$MANUAL_FILE" ]; then
+        local mn="" me=""
+        read -r mn me < "$MANUAL_FILE" 2>/dev/null || true
+        if isnum "${mn:-}"; then
+            isnum "${me:-}" || me=$now
+            amb_nits=$mn; amb_source=manual; amb_age=$(( now - me )); return 0
+        fi
+    fi
+
+    # 2. an external meter, when one is configured
+    if [ -n "$AMBIENT_CMD" ]; then
+        local v; v=$(eval "$AMBIENT_CMD" 2>/dev/null | head -1 | tr -d ' \r')
+        if isnum "${v:-}" && awk -v v="$v" 'BEGIN{exit !(v > 0)}'; then
+            amb_nits=$v; amb_source=sensor; return 0
+        fi
+    fi
+
+    # 3. the built-in panel. Zero nits is the backlight being off - lid shut, or
+    #    displays asleep - which is not a reading of the room at all.
+    local s="" n="" cap="" live=0
+    if read -r s n cap < <("$BB" --nits 2>/dev/null); then
+        isnum "${n:-}" && awk -v n="$n" 'BEGIN{exit !(n > 0)}' && live=1
+    fi
+    local phase=off since=$now
+    if [ -f "$PHASE_FILE" ]; then
+        read -r phase since < "$PHASE_FILE" 2>/dev/null || true
+        isnum "${since:-}" || since=$now
+    fi
+    if [ "$live" = 1 ]; then
+        if [ "$phase" != "als" ]; then
+            phase=als; since=$now
+            echo "als $now" > "$PHASE_FILE"
+            logline "built-in panel awake, settling ${WAKE_SETTLE}s before trusting it"
+        fi
+        if [ $(( now - since )) -ge "$WAKE_SETTLE" ]; then
+            amb_nits=$n; amb_slider=$s; amb_source=als
+            echo "$n $s $now" > "$LIVE_FILE"
+            model_sample "$n" "$now"
+            return 0
+        fi
+    elif [ "$phase" != "off" ]; then
+        echo "off $now" > "$PHASE_FILE"
+        logline "built-in panel off (lid shut or display asleep), ambient from the model"
+    fi
+
+    # 4. the solar model, replaying this machine's own history for this elevation
+    if [ -n "$amb_elev" ]; then
+        local p; p=$(model_predict "$(model_bin "$amb_elev")" 2>/dev/null)
+        if isnum "${p:-}"; then amb_nits=$p; amb_source=solar; return 0; fi
+    fi
+
+    # 5. the last trusted reading
+    if [ -f "$LIVE_FILE" ]; then
+        local ln="" ls="" le=""
+        read -r ln ls le < "$LIVE_FILE" 2>/dev/null || true
+        if isnum "${ln:-}"; then
+            isnum "${le:-}" || le=$now
+            amb_age=$(( now - le ))
+            if [ "$HOLD_MAX_AGE" -gt 0 ] && [ "$amb_age" -gt "$HOLD_MAX_AGE" ]; then
+                return 1
+            fi
+            amb_nits=$ln; amb_source=hold; return 0
+        fi
+    fi
+    return 1
+}
+
+# Target luminance for one display, in DDC units, from the current ambient value.
 target_lum() { # name ll lh
     local mx
-    if [ "$MATCH" = "nits" ]; then
+    if [ "$MATCH" = "nits" ] || [ -z "$amb_slider" ]; then
         mx=$(max_nits "$1")
         if [ -n "$mx" ]; then
-            awk -v n="$b_nits" -v mx="$mx" -v lo="$2" -v hi="$3" 'BEGIN{
+            awk -v n="$amb_nits" -v mx="$mx" -v lo="$2" -v hi="$3" 'BEGIN{
                 v = 100 * n / mx
                 if (v < lo) v = lo; if (v > hi) v = hi
                 printf "%d", v + 0.5 }'
             return
         fi
     fi
-    interp "$b" "$B_LO" "$B_HI" "$2" "$3"
+    interp "$amb_slider" "$B_LO" "$B_HI" "$2" "$3"
 }
 
-# Blue gain follows where the luminance landed, not the raw slider.
+# Blue gain follows where the luminance landed, not the raw ambient value.
 target_blue() { # want_lum ll lh bl bh
     [ -z "$4" ] && return
     awk -v w="$1" -v lo="$2" -v hi="$3" -v bl="$4" -v bh="$5" 'BEGIN{
@@ -121,9 +335,9 @@ parse() { # spec -> sets name ll lh bl bh mode
 # moving, arrives, and only then notices - which reads as chasing, not tracking.
 ramp() { # idx name cur_lum cur_blue ll lh bl bh
     local idx=$1 name=$2 cur=$3 curb=$4 ll=$5 lh=$6 bl=$7 bh=$8
-    local budget=$(( RAMP_MAX_STEPS * 3 )) want wantb b l x leg legb
+    local budget=$(( RAMP_MAX_STEPS * 3 )) want wantb l x leg legb
     while [ "$budget" -gt 0 ]; do
-        read -r b b_nits b_cap < <($BB --nits) || break
+        resolve_ambient || break
         want=$(target_lum "$name" "$ll" "$lh")
         wantb=$(target_blue "$want" "$ll" "$lh" "$bl" "$bh")
         if [ "$want" = "$cur" ] && { [ -z "$wantb" ] || [ "$wantb" = "$curb" ]; }; then break; fi
@@ -148,8 +362,8 @@ ramp() { # idx name cur_lum cur_blue ll lh bl bh
 }
 
 # Drive one monitor to target. Run in background so monitors move together.
-apply_one() { # spec builtin_brightness tick
-    local spec="$1" b="$2" tick="$3" name ll lh bl bh mode
+apply_one() { # spec tick
+    local spec="$1" tick="$2" name ll lh bl bh mode
     parse "$spec"
     [ "$mode" = "gamma" ] && return 0   # held by the resident daemon, not by this tick
     local st="$STATE_DIR/autobrightness.$(slug "$name").state"
@@ -169,8 +383,14 @@ apply_one() { # spec builtin_brightness tick
 
     local idx; idx=$(find_display "$name"); [ -n "$idx" ] || return 0   # unplugged, wait quietly
     local cur_lum cur_blue=""
-    cur_lum=$(m1ddc display "$idx" get luminance 2>/dev/null); cur_lum=${cur_lum:-$want_lum}
-    [ -n "$want_blue" ] && { cur_blue=$(m1ddc display "$idx" get blue 2>/dev/null); cur_blue=${cur_blue:-$want_blue}; }
+    cur_lum=$(m1ddc display "$idx" get luminance 2>/dev/null)
+    cur_blue=""
+    [ -n "$want_blue" ] && cur_blue=$(m1ddc display "$idx" get blue 2>/dev/null)
+    # m1ddc prints its errors on stdout, so a failed read arrives here as a
+    # sentence. Taken as a number it becomes zero and the ramp starts from the
+    # wrong end of the scale; the cache is the better answer.
+    isnum "${cur_lum:-}" || cur_lum="${c_lum:-$want_lum}"
+    [ -n "$want_blue" ] && { isnum "${cur_blue:-}" || cur_blue="${c_blue:-$want_blue}"; }
     # A zero read on a DDC-capable panel means the I2C transaction collided with a
     # write in flight, not that the monitor sits at zero. Trust the cache instead.
     [ "$cur_lum" = "0" ] && [ -n "$c_lum" ] && [ "$c_lum" != "0" ] && cur_lum="$c_lum"
@@ -181,7 +401,7 @@ apply_one() { # spec builtin_brightness tick
     [ -n "$want_blue" ] && d_blue=$(absdiff "$want_blue" "$cur_blue")
 
     if [ "$d_lum" -ge "$HYST_LUM" ] || [ "$d_blue" -ge "$HYST_BLUE" ]; then
-        logline "$name: $cur_lum/${cur_blue:--} -> $want_lum/${want_blue:--} (builtin $b, d=$d_lum/$d_blue)"
+        logline "$name: $cur_lum/${cur_blue:--} -> $want_lum/${want_blue:--} ($amb_source ${amb_nits} nits, d=$d_lum/$d_blue)"
         if [ "$d_lum" -le "$RAMP_DIRECT" ] && [ "$d_blue" -le 2 ]; then
             [ "$d_lum"  -gt 0 ] && m1ddc display "$idx" set luminance "$want_lum" >/dev/null 2>&1
             [ "$d_blue" -gt 0 ] && m1ddc display "$idx" set blue "$want_blue" >/dev/null 2>&1
@@ -195,10 +415,37 @@ apply_one() { # spec builtin_brightness tick
     fi
 }
 
+# uuid -> name, so the gamma daemon can resolve a display by its stable identity
+# instead of an NSScreen list that goes stale the first time a display sleeps.
+write_display_map() {
+    m1ddc display list 2>/dev/null | awk '
+        match($0, /^\[[0-9]+\] /) {
+            rest = substr($0, RLENGTH + 1)
+            if (match(rest, / \([0-9A-Fa-f-]+\)$/)) {
+                printf "%s\t%s\n", substr(rest, RSTART + 2, RLENGTH - 3), substr(rest, 1, RSTART - 1)
+            }
+        }' > "$MAP_FILE.tmp" 2>/dev/null
+    if [ -s "$MAP_FILE.tmp" ]; then
+        cmp -s "$MAP_FILE.tmp" "$MAP_FILE" 2>/dev/null || mv "$MAP_FILE.tmp" "$MAP_FILE"
+    fi
+    rm -f "$MAP_FILE.tmp"
+}
+
 cmd="${1:-status}"
 case "$cmd" in
   pause)   mkdir -p "$STATE_DIR"; touch "$PAUSE_FILE"; echo "paused"; exit 0 ;;
   resume)  rm -f "$PAUSE_FILE" "$STATE_DIR"/autobrightness.*.state; echo "resumed"; exit 0 ;;
+  manual)
+    mkdir -p "$STATE_DIR"
+    case "${2:-}" in
+      ""|show)
+        if [ -f "$MANUAL_FILE" ]; then read -r mn _ < "$MANUAL_FILE"; echo "manual $mn nits"
+        else echo "manual off"; fi ;;
+      off|auto|clear) rm -f "$MANUAL_FILE"; echo "manual off" ;;
+      *) isnum "$2" || die "usage: autobrightness manual <nits> | off"
+         echo "$2 $(date +%s)" > "$MANUAL_FILE"; echo "manual $2 nits" ;;
+    esac
+    exit 0 ;;
   install)
     mkdir -p "$(dirname "$PLIST")"
     cat > "$PLIST" <<PLIST
@@ -218,16 +465,20 @@ PLIST
 
     # Displays without DDC are dimmed through the gamma table, and macOS drops a
     # gamma table when the process that set it exits - so they need a resident
-    # daemon rather than a periodic tick.
-    gspecs=(); gnits=
+    # daemon rather than a periodic tick. It takes no readings of its own: the
+    # tick above resolves ambient once and leaves it in a file.
+    gspecs=()
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
-        [ "$mode" = "gamma" ] && gspecs+=("$name:$ll:$lh") && gnits=$(max_nits "$name")
+        [ "$mode" = "gamma" ] && gspecs+=("$name:$ll:$lh:$(max_nits "$name")")
     done
     launchctl unload "$GPLIST" 2>/dev/null
     rm -f "$GPLIST"
     if [ ${#gspecs[@]} -gt 0 ]; then
         [ -x "$SOFTDIM" ] || die "missing $SOFTDIM - run install.sh"
+        for g in "${gspecs[@]}"; do
+            case "$g" in *:) die "set a peak luminance for ${g%%:*} in DISPLAY_NITS";; esac
+        done
         {
             echo '<?xml version="1.0" encoding="UTF-8"?>'
             echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
@@ -235,7 +486,7 @@ PLIST
             echo "  <key>Label</key><string>local.autobrightness-gamma</string>"
             echo "  <key>ProgramArguments</key><array>"
             echo "    <string>$SOFTDIM</string><string>daemon</string>"
-            echo "    <string>$(( INTERVAL * 1000 ))</string><string>${gnits:-250}</string><string>$PANEL_GAMMA</string>"
+            echo "    <string>$(( INTERVAL * 1000 ))</string><string>$PANEL_GAMMA</string>"
             for g in "${gspecs[@]}"; do echo "    <string>$g</string>"; done
             echo "  </array>"
             echo "  <key>KeepAlive</key><true/>"
@@ -254,13 +505,23 @@ PLIST
 esac
 
 [ -x "$BB" ] || die "missing $BB - run install.sh"
-read -r b b_nits b_cap < <($BB --nits) || die "cannot read built-in display brightness"
 
 case "$cmd" in
   status)
-    echo "built-in display: brightness $b"
+    resolve_ambient || true
+    read -r mb mt < <(model_bins)
+    printf 'ambient: %s nits from %s' "${amb_nits:-?}" "$amb_source"
+    [ "$amb_age" -gt 0 ] && printf ' (%ss old)' "$amb_age"
+    [ -n "$amb_slider" ] && printf ', slider %s' "$amb_slider"
+    printf '\n'
+    if solar_on; then
+        printf 'sun: %s deg, model has %s of %s buckets\n' "$amb_elev" "$mb" "$mt"
+    else
+        printf 'sun: SOLAR_LAT/SOLAR_LON not set, the solar model is off\n'
+    fi
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
+        if [ -z "$amb_nits" ]; then printf '  %-14s no ambient source\n' "$name"; continue; fi
         wl=$(target_lum "$name" "$ll" "$lh")
         if [ "$mode" = "gamma" ]; then
             printf '  %-14s target %3s     now %3s      (gamma, software dimming)\n' \
@@ -270,21 +531,100 @@ case "$cmd" in
         idx=$(find_display "$name")
         if [ -z "$idx" ]; then printf '  %-14s not connected\n' "$name"; continue; fi
         wb="-"; [ -n "$bl" ] && wb=$(target_blue "$wl" "$ll" "$lh" "$bl" "$bh")
-        cl=$(m1ddc display "$idx" get luminance 2>/dev/null)
-        cb="-"; [ -n "$bl" ] && cb=$(m1ddc display "$idx" get blue 2>/dev/null)
-        printf '  %-14s target %3s/%-3s  now %3s/%-3s\n' "$name" "$wl" "$wb" "${cl:-?}" "${cb:-?}"
+        cl=$(m1ddc display "$idx" get luminance 2>/dev/null); isnum "$cl" || cl="?"
+        cb="-"; [ -n "$bl" ] && { cb=$(m1ddc display "$idx" get blue 2>/dev/null); isnum "$cb" || cb="?"; }
+        printf '  %-14s target %3s/%-3s  now %3s/%-3s\n' "$name" "$wl" "$wb" "$cl" "$cb"
     done
+    [ -f "$MANUAL_FILE" ] && echo "state: MANUAL"
     [ -f "$PAUSE_FILE" ] && echo "state: PAUSED"
     exit 0 ;;
 
-  curve)
+  ambient)
+    resolve_ambient || true
+    read -r mb mt < <(model_bins)
+    printf 'nits     %s\nsource   %s\nage      %ss\nslider   %s\nsun      %s\nmodel    %s/%s buckets\n' \
+        "${amb_nits:-none}" "$amb_source" "$amb_age" "${amb_slider:--}" "${amb_elev:--}" "$mb" "$mt"
+    exit 0 ;;
+
+  sun)
+    # The elevation the solar model buckets by. Takes an epoch so the figure can
+    # be checked against an almanac instead of only against the current sky.
+    solar_on || die "set SOLAR_LAT and SOLAR_LON in $CONFIG"
+    t="${2:-$(date +%s)}"
+    isnum "$t" || die "usage: autobrightness sun [epoch]"
+    printf '%s\n' "$(sun_elev "$t")"
+    exit 0 ;;
+
+  model)
+    if [ ! -s "$MODEL_FILE" ]; then echo "the model has no samples yet"; exit 0; fi
+    echo "sun elevation -> learned built-in luminance"
+    sort -n "$MODEL_FILE" | awk -v w="$MODEL_BIN_DEG" -v now="$(date +%s)" '{
+        printf "  %4d..%-4d deg  %7.1f nits  %4d samples  %s\n",
+            $1 * w - 90, ($1 + 1) * w - 90, $2, $3,
+            (now - $4 < 86400 ? "today" : sprintf("%dd ago", int((now - $4) / 86400)))
+    }'
+    exit 0 ;;
+
+  --indicator)
+    # Machine-readable snapshot for the menu bar app. Reads cached per-display
+    # values rather than the bus: the agent refreshes that cache every second
+    # tick, and the indicator must not add DDC traffic of its own.
+    resolve_ambient || true
+    read -r mb mt < <(model_bins)
+    man_nits=""; man_json=null
+    [ -f "$MANUAL_FILE" ] && read -r man_nits _ < "$MANUAL_FILE" 2>/dev/null
+    isnum "${man_nits:-}" && man_json="{\"nits\":$man_nits}"
+    paused=false; [ -f "$PAUSE_FILE" ] && paused=true
+    printf '{"contract":%d,"paused":%s,"ambient":{"nits":%s,"source":"%s","age":%d,"slider":%s,"elevation":%s},' \
+        "$CONTRACT" "$paused" "${amb_nits:-null}" "$amb_source" "$amb_age" \
+        "${amb_slider:-null}" "${amb_elev:-null}"
+    printf '"model":{"bins":%s,"bins_total":%s,"bin_deg":%s,"on":%s},' \
+        "$mb" "$mt" "$MODEL_BIN_DEG" "$(solar_on && echo true || echo false)"
+    printf '"manual":%s,"displays":[' "$man_json"
+    first=1
     for spec in "${DISPLAYS[@]}"; do
         parse "$spec"
-        echo "$name  (built-in brightness -> luminance/blue)"
-        for x in 0.00 0.10 0.20 0.30 0.40 0.50 0.60 0.70 0.80 0.90 1.00; do
-            wb="-"; [ -n "$bl" ] && wb=$(interp "$x" "$B_LO" "$B_HI" "$bl" "$bh")
-            printf '  %-6s -> %3s / %-3s%s\n' "$x" "$(interp "$x" "$B_LO" "$B_HI" "$ll" "$lh")" "$wb" \
-                "$(awk -v a="$x" -v c="$b" 'BEGIN{d=a-c; if(d<0)d=-d; print (d<0.05 ? "   <- now" : "")}')"
+        st="$STATE_DIR/autobrightness.$(slug "$name").state"
+        cl=null; cb=null; age=null
+        if [ -f "$st" ]; then
+            read -r f1 f2 < "$st" 2>/dev/null || true
+            isnum "${f1:-}" && cl=$f1
+            isnum "${f2:-}" && cb=$f2
+            age=$(( $(date +%s) - $(stat -f %m "$st") ))
+        fi
+        # Connectivity comes from the display map the tick leaves behind, not from
+        # m1ddc: the menu bar app polls this several times a minute and must not
+        # put traffic on the bus to do it.
+        conn=false
+        [ -s "$MAP_FILE" ] && conn=$(awk -F'\t' -v n="$name" 'index($2, n) { f = 1 } END { print (f ? "true" : "false") }' "$MAP_FILE")
+        if [ "$mode" = "gamma" ]; then
+            g=$("$SOFTDIM" get "$name" 2>/dev/null)
+            if isnum "${g:-}"; then cl=$g; else cl=null; fi
+        fi
+        wl=null; wb=null
+        if [ -n "$amb_nits" ]; then
+            wl=$(target_lum "$name" "$ll" "$lh")
+            [ -n "$bl" ] && wb=$(target_blue "$wl" "$ll" "$lh" "$bl" "$bh")
+        fi
+        [ "$first" = 1 ] || printf ','
+        first=0
+        printf '{"name":"%s","mode":"%s","connected":%s,"target_lum":%s,"target_blue":%s,"lum":%s,"blue":%s,"age":%s}' \
+            "$name" "$mode" "$conn" "${wl:-null}" "${wb:-null}" "$cl" "$cb" "$age"
+    done
+    printf ']}\n'
+    exit 0 ;;
+
+  curve)
+    resolve_ambient || true
+    for spec in "${DISPLAYS[@]}"; do
+        parse "$spec"
+        mx=$(max_nits "$name")
+        echo "$name  (built-in luminance -> luminance/blue)"
+        for x in 1 2 5 10 20 50 100 150 200 300 400; do
+            amb_nits=$x amb_slider=""
+            wl=$(target_lum "$name" "$ll" "$lh")
+            wb="-"; [ -n "$bl" ] && wb=$(target_blue "$wl" "$ll" "$lh" "$bl" "$bh")
+            printf '  %4s nits -> %3s / %-3s\n' "$x" "$wl" "$wb"
         done
     done
     exit 0 ;;
@@ -300,12 +640,22 @@ case "$cmd" in
     fi
     [ -f "$PAUSE_FILE" ] && exit 0
 
+    write_display_map
+    if ! resolve_ambient; then
+        # Nothing can say what the room is like - first run with the lid already
+        # shut, say. Leave the monitors alone rather than guess.
+        rm -f "$AMBIENT_FILE"
+        exit 0
+    fi
+    echo "$amb_nits $amb_source $(date +%s)" > "$AMBIENT_FILE"
+
     tick=0; [ -f "$TICK_FILE" ] && tick=$(cat "$TICK_FILE" 2>/dev/null || echo 0)
+    isnum "$tick" || tick=0
     tick=$(( tick + 1 )); echo "$tick" > "$TICK_FILE"
 
-    for spec in "${DISPLAYS[@]}"; do apply_one "$spec" "$b" "$tick" & done
+    for spec in "${DISPLAYS[@]}"; do apply_one "$spec" "$tick" & done
     wait
     exit 0 ;;
 
-  *) echo "autobrightness status | curve | once | pause | resume | install | uninstall"; exit 2 ;;
+  *) echo "autobrightness status | ambient | sun [epoch] | model | curve | once | manual <nits>|off | pause | resume | install | uninstall"; exit 2 ;;
 esac
