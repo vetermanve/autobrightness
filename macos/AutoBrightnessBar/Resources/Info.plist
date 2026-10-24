@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>AutoBrightnessBar</string>
+	<key>CFBundleDisplayName</key>
+	<string>autobrightness</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.vetermanve.autobrightness-bar</string>
+	<key>CFBundleExecutable</key>
+	<string>AutoBrightnessBar</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- the indicator lives in the menu bar: no Dock icon, no task switcher entry -->
+	<key>LSUIElement</key>
+	<true/>
+	<!-- only for the "Use my location" button, which fills in the two numbers the
+	     solar model needs. Nothing is sent anywhere; they land in a local config. -->
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Reads your coordinates once to work out the sun's elevation, so screen brightness can follow the time of day while the lid is shut.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT</string>
+</dict>
+</plist>

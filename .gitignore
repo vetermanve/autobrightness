@@ -1,2 +1,6 @@
 .DS_Store
 *.tmp
+
+# SwiftPM build output and the app bundle it assembles
+.build/
+*.app/
